@@ -1,0 +1,38 @@
+# Discord Bot Dependencies
+discord.py>=2.3.0
+
+# Geographic Data Processing
+geopandas>=0.14.0
+shapely>=2.0.0
+
+# Image Processing
+Pillow>=10.0.0
+
+# HTTP Client
+aiohttp>=3.8.0
+
+# System Monitoring
+psutil>=5.9.0
+
+# Feed Parsing
+feedparser>=6.0.10
+
+# HTTP Requests (for validation)
+requests>=2.31.0
+
+# Configuration Files
+PyYAML>=6.0
+
+# Timezone Handling
+pytz>=2023.3
+
+# Base64 encoding (built-in module, no requirement needed)
+# JSON (built-in module, no requirement needed)
+# Asyncio (built-in module, no requirement needed)
+# Pathlib (built-in module, no requirement needed)
+# Datetime (built-in module, no requirement needed)
+# Logging (built-in module, no requirement needed)
+# Math (built-in module, no requirement needed)
+# Collections (built-in module, no requirement needed)
+# Re (built-in module, no requirement needed)
+# OS (built-in module, no requirement needed)
