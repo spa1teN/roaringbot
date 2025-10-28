@@ -22,9 +22,26 @@ class EsportsMatch:
     
     def __init__(self, match_data: Dict):
         self.id = match_data["id"]
-        self.tournament_name = match_data["tournament"]["name"]
-        self.team_a = match_data["lineup_a"]["team"]["name"]
-        self.team_b = match_data["lineup_b"]["team"]["name"]
+        
+        # Safely extract tournament name
+        tournament = match_data.get("tournament")
+        if not tournament:
+            raise ValueError(f"Match {match_data['id']}: tournament data is missing")
+        self.tournament_name = tournament.get("name", "Unknown Tournament")
+        
+        # Safely extract team A name
+        lineup_a = match_data.get("lineup_a")
+        if not lineup_a or not lineup_a.get("team"):
+            raise ValueError(f"Match {match_data['id']}: lineup_a or team_a data is missing")
+        self.team_a = lineup_a["team"].get("name", "Unknown Team A")
+        
+        # Safely extract team B name (use TBA if not yet announced)
+        lineup_b = match_data.get("lineup_b")
+        if not lineup_b or not lineup_b.get("team"):
+            self.team_b = "TBA"
+        else:
+            self.team_b = lineup_b["team"].get("name", "TBA")
+        
         self.start_time = datetime.fromisoformat(match_data["first_map_at"])
         self.end_time = datetime.fromisoformat(match_data["last_map_end"]) if match_data["last_map_end"] else None
         self.cancelled = bool(match_data["cancelled"])
@@ -772,13 +789,46 @@ class EsportsCog(commands.Cog):
                     self.log.error(f"API request failed with status {response.status}")
                     return
                 
-                data = await response.json()
+                try:
+                    data = await response.json()
+                except Exception as e:
+                    self.log.error(f"Failed to parse JSON response: {e}")
+                    return
+                
+                # Check if data is None or not a dictionary
+                if data is None:
+                    self.log.error("API returned None response")
+                    return
+                
+                if not isinstance(data, dict):
+                    self.log.error(f"API returned unexpected data type: {type(data)}")
+                    return
+                
                 matches_data = data.get("results", [])
+                
+                # Ensure matches_data is a list
+                if matches_data is None:
+                    self.log.warning("API results field is None, using empty list")
+                    matches_data = []
+                elif not isinstance(matches_data, list):
+                    self.log.error(f"API results field is not a list: {type(matches_data)}")
+                    return
             
             # Process matches
             current_matches = {}
             for match_data in matches_data:
-                match = EsportsMatch(match_data)
+                # Skip None entries
+                if match_data is None:
+                    self.log.warning("Skipping None match entry in API response")
+                    continue
+                
+                # Try to create EsportsMatch with error handling
+                try:
+                    match = EsportsMatch(match_data)
+                except Exception as e:
+                    self.log.error(f"Error creating EsportsMatch from data: {e}")
+                    self.log.debug(f"Problematic match data: {match_data}")
+                    continue
 
                 # Restore event ID from stored mappings
                 for event_id, stored_match_id in self.event_to_match.items():
