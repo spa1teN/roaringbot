@@ -4,7 +4,13 @@ config/google_credentials.json
 
 # Runtime data (server-specific, transferred manually)
 config/esports_data.json
-config/mod_config.json
+config/moderation_config.json
+config/*/
+data/sources.txt
+
+# Editor backups
+*~
+\#*\#
 
 # Python
 __pycache__/
