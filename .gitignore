@@ -1,0 +1,30 @@
+# Environment & secrets
+.env*
+config/google_credentials.json
+
+# Runtime data (server-specific, transferred manually)
+config/esports_data.json
+config/mod_config.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyc
+*~
+*.bak
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Logs
+logs/
+
+# Cache
+data/cache/
+
+# Editor
+.claude/
+core/#*#

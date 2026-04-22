@@ -1,12 +1,9 @@
 # Discord Bot Dependencies
 discord.py>=2.3.0
 
-# Geographic Data Processing
-geopandas>=0.14.0
-shapely>=2.0.0
-
-# Image Processing
-Pillow>=10.0.0
+# Google Sheets Integration
+gspread>=6.0.0
+google-auth>=2.0.0
 
 # HTTP Client
 aiohttp>=3.8.0

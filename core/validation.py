@@ -194,11 +194,9 @@ class SystemValidator:
             'discord': 'discord.py',
             'aiohttp': 'aiohttp',
             'feedparser': 'feedparser',
-            'geopandas': 'geopandas',
             'psutil': 'psutil',
             'requests': 'requests',
-            'yaml': 'PyYAML',
-            'PIL': 'Pillow'
+            'yaml': 'PyYAML'
         }
         
         missing_packages = []
@@ -280,11 +278,6 @@ def run_full_validation() -> Dict[str, Any]:
     for dir_name in ["logs", "config", "data"]:
         valid, msg = ConfigValidator.validate_directory_permissions(dir_name)
         add_result(valid, f"Directory {dir_name}: {msg}")
-    
-    # Geospatial data validation
-    data_dir = Path("data")
-    valid, msg = SystemValidator.validate_geospatial_data(data_dir)
-    add_result(valid, f"Geospatial Data: {msg}")
     
     return results
 

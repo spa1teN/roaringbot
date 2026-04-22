@@ -163,7 +163,7 @@ logging.basicConfig(
     datefmt=DATE_FORMAT,
     handlers=[
         logging.StreamHandler(),
-        TimedRotatingFileHandler("logs/roaringbot.log", when="midnight", interval=1, backupCount=1, encoding="utf-8")
+        TimedRotatingFileHandler("logs/roaringbot.log", when="midnight", interval=1, backupCount=30, encoding="utf-8")
     ]
 )
 
@@ -175,7 +175,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-COGS = ["cogs.map", "cogs.moderation", "cogs.esports"]
+COGS = ["cogs.moderation", "cogs.esports", "cogs.birthday"]
 
 # ─── Enhanced Bot-Klasse ────────────────────────────────────────────────────
 class RoaringBot(commands.Bot):
@@ -224,12 +224,12 @@ class RoaringBot(commands.Bot):
                 console_handler.setFormatter(formatter)
                 logger.addHandler(console_handler)
                 
-                # File handler with 24-hour rotation
+                # File handler with 24-hour rotation (30 days retention)
                 file_handler = TimedRotatingFileHandler(
                     f"logs/{cog_name}.log", 
                     when="midnight", 
                     interval=1, 
-                    backupCount=1, 
+                    backupCount=30, 
                     encoding="utf-8"
                 )
                 file_handler.setLevel(logging.INFO)

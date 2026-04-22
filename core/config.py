@@ -34,11 +34,25 @@ class BotConfig:
     def log_level(self) -> str:
         return os.getenv("LOG_LEVEL", "INFO").upper()
 
-    # Map Configuration
+    # Birthday Configuration
     @property
-    def pin_cooldown_minutes(self) -> int:
-        return int(os.getenv("MAP_PIN_COOLDOWN_MINUTES", "30"))
-    
+    def birthday_channel_id(self) -> Optional[int]:
+        val = os.getenv("BIRTHDAY_CHANNEL_ID")
+        return int(val) if val else None
+
+    @property
+    def birthday_spreadsheet_id(self) -> Optional[str]:
+        return os.getenv("BIRTHDAY_SPREADSHEET_ID")
+
+    @property
+    def google_service_account_file(self) -> str:
+        return os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "config/google_credentials.json")
+
+    @property
+    def birthday_emote_id(self) -> Optional[int]:
+        val = os.getenv("BIRTHDAY_EMOTE_ID")
+        return int(val) if val else None
+
     # Cache Configuration
     @property
     def max_cache_size_mb(self) -> int:
@@ -143,7 +157,7 @@ class BotConfig:
         log.info(f"  Guild ID: {self.guild_id}")
         log.info(f"  Owner ID: {self.owner_id}")
         log.info(f"  Log Level: {self.log_level}")
-        log.info(f"  Pin Cooldown: {self.pin_cooldown_minutes} minutes")
+        log.info(f"  Birthday Channel: {self.birthday_channel_id or 'Not configured'}")
         log.info(f"  Max Cache Size: {self.max_cache_size_mb} MB")
         log.info(f"  HTTP Timeout: {self.http_timeout} seconds")
         log.info(f"  Webhook Logging: {'Enabled' if self.log_webhook_url else 'Disabled'}")
