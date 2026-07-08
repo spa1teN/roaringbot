@@ -2,7 +2,7 @@
 
 import asyncio
 import logging
-from datetime import datetime, time
+from datetime import datetime, time, timezone
 
 import discord
 from discord.ext import commands, tasks
@@ -11,11 +11,16 @@ from google.oauth2.service_account import Credentials
 import pytz
 
 from core.config import config
+from core.status_reporter import status_reporter
 
 GERMAN_TZ = pytz.timezone("Europe/Berlin")
 
 # Google Sheets API scopes
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class BirthdayCog(commands.Cog):
@@ -31,9 +36,26 @@ class BirthdayCog(commands.Cog):
             )
             self.gc = gspread.authorize(creds)
             self.log.info("Google Sheets client initialized")
+            status_reporter.record("birthday", sheets_connected=True, last_error=None)
         except Exception as e:
             self.log.error(f"Failed to initialize Google Sheets client: {e}")
+            status_reporter.record("birthday", sheets_connected=False, last_error=str(e))
             return
+
+        status_reporter.record(
+            "birthday",
+            channel_id=config.birthday_channel_id,
+            spreadsheet_id=config.birthday_spreadsheet_id,
+        )
+
+        try:
+            records = await asyncio.get_event_loop().run_in_executor(None, self._fetch_birthdays)
+            status_reporter.record(
+                "birthday",
+                upcoming_birthdays=self._compute_upcoming(records, datetime.now(GERMAN_TZ).date()),
+            )
+        except Exception as e:
+            self.log.warning(f"Initial upcoming-birthdays fetch failed (will retry on daily check): {e}")
 
         self.check_birthdays.start()
 
@@ -54,6 +76,10 @@ class BirthdayCog(commands.Cog):
         channel = self.bot.get_channel(config.birthday_channel_id)
         if not channel:
             self.log.warning(f"Birthday channel {config.birthday_channel_id} not found")
+            status_reporter.record(
+                "birthday", last_check_at=_now_iso(), last_check_result="error",
+                last_error=f"channel {config.birthday_channel_id} not found",
+            )
             return
 
         try:
@@ -62,11 +88,16 @@ class BirthdayCog(commands.Cog):
             )
         except Exception as e:
             self.log.error(f"Failed to read birthday spreadsheet: {e}")
+            status_reporter.record(
+                "birthday", last_check_at=_now_iso(), last_check_result="error", last_error=str(e)
+            )
             return
 
         today_str = now_berlin.strftime("%d.%m")
+        upcoming_birthdays = self._compute_upcoming(records, now_berlin.date())
 
         birthday_names = []
+        invalid_dates = 0
         for record in records:
             discord_name = record.get("Discord", "").strip()
             date_str = record.get("Geburtsdatum", "").strip()
@@ -86,6 +117,7 @@ class BirthdayCog(commands.Cog):
                 row_day_month = parsed.strftime("%d.%m")
             except ValueError:
                 self.log.warning(f"Invalid date format for '{discord_name}': '{date_str}'")
+                invalid_dates += 1
                 continue
 
             if row_day_month == today_str:
@@ -93,6 +125,15 @@ class BirthdayCog(commands.Cog):
 
         if not birthday_names:
             self.log.info("No birthdays today")
+            status_reporter.record(
+                "birthday",
+                last_check_at=_now_iso(),
+                last_check_result="no_birthdays",
+                last_error=None,
+                invalid_date_entries=invalid_dates,
+                registered_entries=len(records),
+                upcoming_birthdays=upcoming_birthdays,
+            )
             return
 
         # Build birthday emote string
@@ -114,6 +155,52 @@ class BirthdayCog(commands.Cog):
         )
         await channel.send(embed=embed)
         self.log.info(f"Sent birthday message for: {', '.join(birthday_names)}")
+        status_reporter.record(
+            "birthday",
+            last_check_at=_now_iso(),
+            last_check_result="sent",
+            last_error=None,
+            invalid_date_entries=invalid_dates,
+            registered_entries=len(records),
+            last_birthday_names=birthday_names,
+            upcoming_birthdays=upcoming_birthdays,
+        )
+
+    def _compute_upcoming(self, records: list, today, limit: int = 5) -> list:
+        """Return the next `limit` upcoming birthdays, sorted by days until next occurrence."""
+        upcoming = []
+        for record in records:
+            discord_name = record.get("Discord", "").strip()
+            date_str = record.get("Geburtsdatum", "").strip()
+            left_date = record.get("Datum Austritt", "").strip()
+            if not discord_name or discord_name == "-" or not date_str or left_date:
+                continue
+            try:
+                parts = date_str.split(".")
+                if len(parts) == 3:
+                    parsed = datetime.strptime(date_str, "%d.%m.%Y")
+                elif len(parts) == 2:
+                    parsed = datetime.strptime(date_str, "%d.%m")
+                else:
+                    continue
+            except ValueError:
+                continue
+
+            try:
+                next_date = parsed.replace(year=today.year).date()
+                if next_date < today:
+                    next_date = next_date.replace(year=today.year + 1)
+            except ValueError:
+                continue  # e.g. 29.02 in a non-leap year
+
+            upcoming.append({
+                "name": discord_name,
+                "date": parsed.strftime("%d.%m"),
+                "days_until": (next_date - today).days,
+            })
+
+        upcoming.sort(key=lambda u: u["days_until"])
+        return upcoming[:limit]
 
     def _fetch_birthdays(self) -> list:
         """Fetch all records from the Register worksheet (synchronous, run in executor)"""

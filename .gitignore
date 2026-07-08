@@ -31,6 +31,10 @@ logs/
 # Cache
 data/cache/
 
+# Generated status snapshot (see DATA_INTERFACE.md)
+data/status.json
+data/.status-*
+
 # Editor
 .claude/
 core/#*#

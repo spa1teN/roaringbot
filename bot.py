@@ -15,6 +15,7 @@ from core.config import config
 from core.cache_manager import cache_manager
 from core.http_client import http_client
 from core.validation import run_full_validation, log_validation_results
+from core.status_reporter import status_reporter
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -249,15 +250,15 @@ class RoaringBot(commands.Bot):
         # Start cache management
         await cache_manager.start_cleanup_task()
         log.info("✅ Cache manager started")
-        
+
         # Start webhook worker if handler exists
         if self.webhook_handler:
             await self.webhook_handler.start_webhook_worker()
             log.info("✅ Webhook logger started")
-        
+
         # Create logs directory for cog-specific logs
         os.makedirs("logs", exist_ok=True)
-        
+
         # Load extensions
         for ext in COGS:
             try:
@@ -265,9 +266,12 @@ class RoaringBot(commands.Bot):
                 log.info(f"✅ Loaded extension {ext}")
             except Exception as e:
                 log.exception(f"❌ Failed to load extension {ext}: {e}")
-        
+
         await self.tree.sync()
         log.info("✅ All slash commands synced")
+
+        status_reporter.record("bot", loaded_cogs=list(self.cogs.keys()))
+        await status_reporter.start(asyncio)
 
     async def on_ready(self):
         status = discord.Status.online
@@ -278,40 +282,68 @@ class RoaringBot(commands.Bot):
         #await self.change_presence(status=status, activity=activity)
         log.info(f"🤖 Logged in as {self.user} (ID: {self.user.id})")
         log.info(f"📊 Connected to {len(self.guilds)} guild(s)")
+        status_reporter.record(
+            "bot",
+            user=str(self.user),
+            user_id=self.user.id,
+            guild_count=len(self.guilds),
+            latency_ms=round(self.latency * 1000) if self.latency else None,
+            gateway_status="connected",
+        )
         print("------")
-    
+
+    async def on_disconnect(self):
+        status_reporter.record("bot", gateway_status="disconnected")
+
+    async def on_resumed(self):
+        status_reporter.bump_counter("bot", "reconnects")
+        status_reporter.record(
+            "bot",
+            gateway_status="connected",
+            latency_ms=round(self.latency * 1000) if self.latency else None,
+        )
+
     async def on_command_error(self, ctx, error):
         """Handle command errors and log them"""
         if isinstance(error, commands.CommandNotFound):
             return  # Ignore unknown commands
-        
+
+        status_reporter.bump_counter("bot", "command_errors")
         log.error(
             f"Command error in '{ctx.command}' used by {ctx.author} (ID: {ctx.author.id}) "
             f"in guild {ctx.guild.id if ctx.guild else 'DM'}: {error}",
             exc_info=True
         )
-    
+
     async def on_error(self, event, *args, **kwargs):
         """Handle general bot errors"""
+        status_reporter.bump_counter("bot", "errors")
         log.error(f"Bot error in event '{event}'", exc_info=True)
-    
+
     async def close(self):
         """Cleanup when bot is shutting down"""
         log.info("🔄 Bot is shutting down...")
-        
+
+        status_reporter.record("bot", gateway_status="disconnected")
+        try:
+            status_reporter.write()
+        except Exception:
+            pass
+        await status_reporter.stop()
+
         # Stop cache manager
         await cache_manager.stop_cleanup_task()
         log.info("✅ Cache manager stopped")
-        
+
         # Stop HTTP client
         await http_client.close()
         log.info("✅ HTTP client closed")
-        
+
         # Stop webhook handler
         if self.webhook_handler:
             await self.webhook_handler.stop_webhook_worker()
             log.info("✅ Webhook logger stopped")
-        
+
         await super().close()
 
 # ─── Main ───────────────────────────────────────────────────────────────────

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 import logging
 from core.config import config
+from core.status_reporter import status_reporter
 
 log = logging.getLogger("tausendsassa.cache")
 
@@ -227,6 +228,13 @@ class CacheManager:
         
     async def start_cleanup_task(self):
         """Start the periodic cleanup task"""
+        status_reporter.record(
+            "cache",
+            memory_items=self.memory_cache.size(),
+            memory_max_items=self.memory_cache.max_items,
+            file_mb=round(await self.file_cache.get_cache_size() / 1024 / 1024, 1),
+            file_max_mb=config.max_cache_size_mb,
+        )
         if self.cleanup_task is None or self.cleanup_task.done():
             self.cleanup_task = asyncio.create_task(self._periodic_cleanup())
             log.info("Started cache cleanup task")
@@ -251,7 +259,14 @@ class CacheManager:
                 memory_size = self.memory_cache.size()
                 file_size = await self.file_cache.get_cache_size()
                 log.info(f"Cache stats - Memory: {memory_size} items, File: {file_size / 1024 / 1024:.1f}MB")
-                
+                status_reporter.record(
+                    "cache",
+                    memory_items=memory_size,
+                    memory_max_items=self.memory_cache.max_items,
+                    file_mb=round(file_size / 1024 / 1024, 1),
+                    file_max_mb=config.max_cache_size_mb,
+                )
+
             except Exception as e:
                 log.error(f"Error in cache cleanup task: {e}")
                 await asyncio.sleep(300)  # Wait 5 minutes before retrying

@@ -1,5 +1,5 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from discord import app_commands
 import json
 import os
@@ -10,6 +10,7 @@ import asyncio
 
 # Import timezone utilities
 from core.timezone_util import get_current_time, get_current_timestamp, save_guild_timezone, get_guild_timezone
+from core.status_reporter import status_reporter
 
 class ModerationCog(commands.Cog):
     def __init__(self, bot):
@@ -18,6 +19,7 @@ class ModerationCog(commands.Cog):
         self.config = self.load_config()
         self.member_join_times = {}  # Store join times for leave duration calculation
         self.recently_banned_kicked = set()  # Track recently banned/kicked users
+        self.honeypot_guild_id = 624700952636817448
 
     def load_config(self) -> dict:
         """Load configuration from JSON file"""
@@ -274,7 +276,8 @@ class ModerationCog(commands.Cog):
                     if time_diff.total_seconds() < 10:
                         # Add to banned/kicked set and send kick embed
                         self.recently_banned_kicked.add(user_id)
-                        
+                        status_reporter.bump_counter("moderation", "kicks")
+
                         embed = self.create_kick_embed(entry.target, entry.user, entry.reason, guild)
                         await self.send_log_message(guild.id, embed)
                         return True
@@ -285,6 +288,7 @@ class ModerationCog(commands.Cog):
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
         """Handle member join events"""
+        status_reporter.bump_counter("moderation", "joins")
         # Store join time for duration calculation
         self.member_join_times[member.id] = datetime.now(timezone.utc)
         
@@ -318,18 +322,19 @@ class ModerationCog(commands.Cog):
         if member.id in self.recently_banned_kicked:
             self.recently_banned_kicked.discard(member.id)  # Remove from set
             return
-        
+
         # Check for recent kick in audit logs
         if await self.check_for_kick(member.guild, member.id):
             return
-        
+
+        status_reporter.bump_counter("moderation", "leaves")
         # Calculate duration on server
         duration = None
         if member.id in self.member_join_times:
             join_time = self.member_join_times[member.id]
             duration = self.calculate_duration(join_time)
             del self.member_join_times[member.id]
-        
+
         # Send log message
         embed = self.create_leave_embed(member, duration)
         await self.send_log_message(member.guild.id, embed)
@@ -337,6 +342,7 @@ class ModerationCog(commands.Cog):
     @commands.Cog.listener()
     async def on_member_ban(self, guild: discord.Guild, user: discord.User):
         """Handle member ban events"""
+        status_reporter.bump_counter("moderation", "bans")
         # Add user to recently banned set to prevent leave message
         self.recently_banned_kicked.add(user.id)
         
@@ -382,6 +388,7 @@ class ModerationCog(commands.Cog):
         # Check if timeout status changed
         if before.timed_out_until != after.timed_out_until:
             if after.timed_out_until:  # Member was timed out
+                status_reporter.bump_counter("moderation", "timeouts")
                 # Try to get moderator and reason from audit log
                 moderator = None
                 reason = None
@@ -441,7 +448,13 @@ class ModerationCog(commands.Cog):
             # Delete messages (Discord API limit is 100 messages at once)
             deleted = await channel.purge(limit=amount)
             deleted_count = len(deleted)
-            
+            status_reporter.record(
+                "moderation",
+                last_clear_count=deleted_count,
+                last_clear_channel_id=channel.id,
+                last_clear_by=str(interaction.user),
+            )
+
             # Create success embed
             embed = discord.Embed(
                 title="🧹 Messages Cleared",
@@ -459,6 +472,40 @@ class ModerationCog(commands.Cog):
                 await interaction.followup.send("❌ Cannot delete messages older than 14 days. Try with a smaller number.", ephemeral=True)
             else:
                 await interaction.followup.send("❌ An error occurred while deleting messages.", ephemeral=True)
+
+
+    async def cog_load(self):
+        self.honeypot_ban_loop.start()
+
+    def cog_unload(self):
+        self.honeypot_ban_loop.cancel()
+
+    @tasks.loop(seconds=60)
+    async def honeypot_ban_loop(self):
+        status_reporter.record("moderation", honeypot_loop_alive=True)
+        guild = self.bot.get_guild(self.honeypot_guild_id)
+        if not guild:
+            return
+
+        config = self.get_guild_config(guild.id)
+        honeypot_role_id = config.get('honeypot_role')
+        if not honeypot_role_id:
+            return
+
+        role = guild.get_role(honeypot_role_id)
+        if not role:
+            return
+
+        for member in list(role.members):
+            try:
+                await guild.ban(member, reason="Autobann", delete_message_days=0)
+                status_reporter.bump_counter("moderation", "honeypot_bans")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+    @honeypot_ban_loop.before_loop
+    async def before_honeypot_ban_loop(self):
+        await self.bot.wait_until_ready()
 
 
 async def setup(bot):

@@ -4,6 +4,7 @@ import asyncio
 import logging
 from typing import Optional, Dict, Any, Union
 from core.config import config
+from core.status_reporter import status_reporter
 
 log = logging.getLogger("roaringbot.http")
 
@@ -98,15 +99,16 @@ class HTTPClientManager:
             try:
                 session = await self.get_session()
                 response = await session.request(method, url, **kwargs)
-                
+
                 # If we get here, the request succeeded
+                status_reporter.bump_counter("http", "requests")
                 if attempt > 0:
                     log.info(f"Request to {url} succeeded on attempt {attempt + 1}")
                 return response
                 
-            except (asyncio.TimeoutError, aiohttp.ClientTimeout, 
-                   aiohttp.ServerTimeoutError) as e:
+            except (asyncio.TimeoutError, aiohttp.ServerTimeoutError) as e:
                 last_exception = e
+                status_reporter.bump_counter("http", "timeouts")
                 if attempt < max_retries:
                     delay = retry_delay * (2 ** attempt)  # Exponential backoff
                     log.warning(f"Request to {url} timed out (attempt {attempt + 1}/{max_retries + 1}), "
@@ -115,11 +117,13 @@ class HTTPClientManager:
                     continue
                 else:
                     log.error(f"Request to {url} failed after {max_retries + 1} attempts: {e}")
+                    status_reporter.record("http", last_error=f"Timeout: {url}")
                     raise
-                    
-            except (aiohttp.ClientConnectionError, aiohttp.ClientConnectorError, 
+
+            except (aiohttp.ClientConnectionError, aiohttp.ClientConnectorError,
                    aiohttp.ClientOSError) as e:
                 last_exception = e
+                status_reporter.bump_counter("http", "connection_errors")
                 if attempt < max_retries:
                     delay = retry_delay * (2 ** attempt)  # Exponential backoff
                     log.warning(f"Connection error for {url} (attempt {attempt + 1}/{max_retries + 1}), "
@@ -128,10 +132,13 @@ class HTTPClientManager:
                     continue
                 else:
                     log.error(f"Connection to {url} failed after {max_retries + 1} attempts: {e}")
+                    status_reporter.record("http", last_error=f"Connection error: {url}")
                     raise
-                    
+
             except Exception as e:
                 # For other exceptions, don't retry
+                status_reporter.bump_counter("http", "other_errors")
+                status_reporter.record("http", last_error=f"{type(e).__name__}: {url}")
                 log.error(f"Non-retryable error for {url}: {e}")
                 raise
         

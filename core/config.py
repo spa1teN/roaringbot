@@ -107,6 +107,11 @@ class BotConfig:
     def esports_update_channel_id(self) -> Optional[int]:
         channel_id = os.getenv("ESPORTS_UPDATE_CHANNEL_ID")
         return int(channel_id) if channel_id else None
+
+    @property
+    def esports_forum_channel_id(self) -> Optional[int]:
+        channel_id = os.getenv("ESPORTS_FORUM_CHANNEL_ID")
+        return int(channel_id) if channel_id else None
     
     @property
     def esports_guild_id(self) -> Optional[int]:

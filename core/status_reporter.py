@@ -1,0 +1,120 @@
+# core/status_reporter.py
+"""
+Central status/health aggregator for RoaringBot.
+
+Every subsystem pushes small, cheap updates in here (a dict merge or a
+counter bump). A background task periodically snapshots everything into
+data/status.json — a single file external tools (e.g. the dashboard) can
+read without touching Docker logs. See DATA_INTERFACE.md for the schema.
+"""
+import json
+import logging
+import os
+import tempfile
+import time
+from collections import defaultdict, deque
+from datetime import datetime, timezone
+from typing import Any, Deque, Dict
+
+log = logging.getLogger("roaringbot.status")
+
+STATUS_FILE = os.path.join("data", "status.json")
+WRITE_INTERVAL_SECONDS = 15
+
+# How long counter events are kept around before they age out of every window.
+_COUNTER_RETENTION_SECONDS = 24 * 3600
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class StatusReporter:
+    """Thread-unsafe by design — only ever touched from the bot's asyncio loop."""
+
+    def __init__(self):
+        self._sections: Dict[str, Dict[str, Any]] = defaultdict(dict)
+        self._counters: Dict[str, Dict[str, Deque[float]]] = defaultdict(lambda: defaultdict(deque))
+        self._started_at = time.time()
+        self._task = None
+
+    # ─── Writers used by cogs/core modules ─────────────────────────────────
+    def record(self, section: str, **fields):
+        """Merge fields into a named section (e.g. record('birthday', last_check_result='sent'))."""
+        self._sections[section].update(fields)
+        self._sections[section]["updated_at"] = _now_iso()
+
+    def record_event(self, section: str, list_key: str, entry: Any, max_len: int = 20):
+        """Append a timestamped entry to a rolling list within a section (e.g. recent errors)."""
+        events = self._sections[section].setdefault(list_key, [])
+        events.append({"at": _now_iso(), **entry} if isinstance(entry, dict) else {"at": _now_iso(), "value": entry})
+        del events[:-max_len]
+        self._sections[section]["updated_at"] = _now_iso()
+
+    def bump_counter(self, section: str, counter: str):
+        """Record one occurrence of an event for rolling-window rate counting (15m/1h/24h)."""
+        self._counters[section][counter].append(time.time())
+
+    # ─── Snapshot assembly ──────────────────────────────────────────────────
+    def _counter_windows(self, timestamps: Deque[float], now: float) -> Dict[str, int]:
+        while timestamps and now - timestamps[0] > _COUNTER_RETENTION_SECONDS:
+            timestamps.popleft()
+        return {
+            "15m": sum(1 for t in timestamps if now - t <= 900),
+            "1h": sum(1 for t in timestamps if now - t <= 3600),
+            "24h": len(timestamps),
+        }
+
+    def snapshot(self) -> Dict[str, Any]:
+        now = time.time()
+        sections = {name: dict(fields) for name, fields in self._sections.items()}
+        for section, counters in self._counters.items():
+            target = sections.setdefault(section, {})
+            target["counters"] = {name: self._counter_windows(ts, now) for name, ts in counters.items()}
+        return {
+            "generated_at": _now_iso(),
+            "uptime_seconds": int(now - self._started_at),
+            **sections,
+        }
+
+    def write(self):
+        """Atomically write the current snapshot to data/status.json."""
+        os.makedirs(os.path.dirname(STATUS_FILE), exist_ok=True)
+        data = self.snapshot()
+        fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(STATUS_FILE), prefix=".status-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False, default=str)
+            os.replace(tmp_path, STATUS_FILE)
+        except Exception:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            raise
+
+    # ─── Lifecycle ───────────────────────────────────────────────────────────
+    async def start(self, loop_asyncio_module):
+        """Start the periodic writer. Pass in `asyncio` to avoid importing it at module load."""
+        if self._task and not self._task.done():
+            return
+        self._task = loop_asyncio_module.create_task(self._writer_loop(loop_asyncio_module))
+        log.info("Started status reporter writer task")
+
+    async def stop(self):
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except Exception:
+                pass
+
+    async def _writer_loop(self, asyncio_module):
+        while True:
+            try:
+                self.write()
+            except Exception as e:
+                log.error(f"Error writing status snapshot: {e}")
+            await asyncio_module.sleep(WRITE_INTERVAL_SECONDS)
+
+
+# Global singleton, mirrors core.cache_manager / core.http_client pattern
+status_reporter = StatusReporter()

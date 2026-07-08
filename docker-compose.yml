@@ -1,0 +1,10 @@
+services:
+  bot:
+    build: .
+    container_name: roaringbot
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./config:/app/config
+      - ./logs:/app/logs
+      - ./data:/app/data
