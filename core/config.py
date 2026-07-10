@@ -27,10 +27,6 @@ class BotConfig:
     
     # Logging Configuration
     @property
-    def log_webhook_url(self) -> Optional[str]:
-        return os.getenv("LOG_WEBHOOK_URL")
-    
-    @property
     def log_level(self) -> str:
         return os.getenv("LOG_LEVEL", "INFO").upper()
 
@@ -51,6 +47,24 @@ class BotConfig:
     @property
     def birthday_emote_id(self) -> Optional[int]:
         val = os.getenv("BIRTHDAY_EMOTE_ID")
+        return int(val) if val else None
+
+    # Kassenbuch / Finance Configuration
+    @property
+    def kassenbuch_service_account_file(self) -> str:
+        return os.getenv("KASSENBUCH_SERVICE_ACCOUNT_FILE", "config/kassenbuch_credentials.json")
+
+    @property
+    def kassenbuch_spreadsheet_id(self) -> Optional[str]:
+        return os.getenv("KASSENBUCH_SPREADSHEET_ID")
+
+    @property
+    def kassenbuch_worksheet_name(self) -> str:
+        return os.getenv("KASSENBUCH_WORKSHEET_NAME", "Kassenbuch")
+
+    @property
+    def kassenbuch_channel_id(self) -> Optional[int]:
+        val = os.getenv("KASSENBUCH_CHANNEL_ID")
         return int(val) if val else None
 
     # Cache Configuration
@@ -163,9 +177,9 @@ class BotConfig:
         log.info(f"  Owner ID: {self.owner_id}")
         log.info(f"  Log Level: {self.log_level}")
         log.info(f"  Birthday Channel: {self.birthday_channel_id or 'Not configured'}")
+        log.info(f"  Kassenbuch Channel: {self.kassenbuch_channel_id or 'Not configured'}")
         log.info(f"  Max Cache Size: {self.max_cache_size_mb} MB")
         log.info(f"  HTTP Timeout: {self.http_timeout} seconds")
-        log.info(f"  Webhook Logging: {'Enabled' if self.log_webhook_url else 'Disabled'}")
         log.info(f"  E-Sports Monitoring: {'Enabled' if self.esports_enabled else 'Disabled'}")
         if self.esports_enabled:
             log.info(f"    Poll Interval: {self.esports_poll_interval_minutes} minutes")

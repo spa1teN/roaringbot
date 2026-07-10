@@ -1,8 +1,6 @@
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
-import json
-import os
 from datetime import datetime, timezone
 from typing import Optional
 import aiohttp
@@ -15,50 +13,26 @@ from core.status_reporter import status_reporter
 class ModerationCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.config_file = "config/moderation_config.json"
-        self.config = self.load_config()
+        self.log = bot.get_cog_logger("moderation")
         self.member_join_times = {}  # Store join times for leave duration calculation
         self.recently_banned_kicked = set()  # Track recently banned/kicked users
         self.honeypot_guild_id = 624700952636817448
 
-    def load_config(self) -> dict:
-        """Load configuration from JSON file"""
-        # Ensure config directory exists
-        os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
-        
-        if os.path.exists(self.config_file):
-            try:
-                with open(self.config_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, IOError):
-                return {}
-        return {}
-
-    def save_config(self):
-        """Save configuration to JSON file"""
-        try:
-            # Ensure config directory exists
-            os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
-            with open(self.config_file, 'w', encoding='utf-8') as f:
-                json.dump(self.config, f, indent=2, ensure_ascii=False)
-        except IOError:
-            pass  # Fail silently if unable to save
-
-    def get_guild_config(self, guild_id: int) -> dict:
+    async def get_guild_config(self, guild_id: int) -> dict:
         """Get configuration for specific guild"""
-        return self.config.get(str(guild_id), {})
+        return await self.bot.db.moderation.get_guild_config(guild_id)
 
-    def set_guild_config(self, guild_id: int, key: str, value):
+    async def set_guild_config(self, guild_id: int, key: str, value):
         """Set configuration value for specific guild"""
-        guild_str = str(guild_id)
-        if guild_str not in self.config:
-            self.config[guild_str] = {}
-        self.config[guild_str][key] = value
-        self.save_config()
+        await self.bot.db.moderation.set_guild_config(guild_id, key, value)
 
-    def create_dashboard_embed(self, guild_id: int) -> discord.Embed:
+    async def clear_guild_config(self, guild_id: int, key: str):
+        """Clear a single configuration value for a specific guild"""
+        await self.bot.db.moderation.clear_guild_config(guild_id, key)
+
+    async def create_dashboard_embed(self, guild_id: int) -> discord.Embed:
         """Create embed for moderation dashboard"""
-        config = self.get_guild_config(guild_id)
+        config = await self.get_guild_config(guild_id)
         
         embed = discord.Embed(
             title="🛡️ Moderation Dashboard",
@@ -102,12 +76,34 @@ class ModerationCog(commands.Cog):
                 value="❌ **Disabled**\nClick 'Setup Join Role' to enable",
                 inline=False
             )
-        
+
+        # Honeypot configuration
+        honeypot_role_id = config.get('honeypot_role')
+        if honeypot_role_id:
+            guild = self.bot.get_guild(guild_id)
+            if guild:
+                role = guild.get_role(honeypot_role_id)
+                role_mention = role.mention if role else f"Role not found (ID: {honeypot_role_id})"
+            else:
+                role_mention = f"Role ID: {honeypot_role_id}"
+
+            embed.add_field(
+                name="🍯 Honeypot",
+                value=f"✅ **Enabled**\nAuto-banning members with role: {role_mention}",
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="🍯 Honeypot",
+                value="❌ **Disabled**\nClick 'Setup Honeypot' to enable",
+                inline=False
+            )
+
         embed.set_footer(text=f"Guild ID: {guild_id}")
         
         return embed
 
-    def create_join_embed(self, member: discord.Member, role_assigned=None, role_name=None) -> discord.Embed:
+    def create_join_embed(self, member: discord.Member, role_assigned=None, role_name=None, role_id=None) -> discord.Embed:
         """Create embed for member join event"""
         embed = discord.Embed(
             title=f"{member.display_name} joined the server",
@@ -130,9 +126,6 @@ class ModerationCog(commands.Cog):
         # Add role assignment status if join role is configured
         if role_assigned is not None:
             if role_assigned:
-                # Get role ID from the member's guild to use proper mention format
-                config = self.get_guild_config(member.guild.id)
-                role_id = config.get('join_role')
                 if role_id:
                     embed.add_field(name="Auto Role", value=f"<@&{role_id}>", inline=True)
                 else:
@@ -242,28 +235,39 @@ class ModerationCog(commands.Cog):
         
         return ", ".join(parts)
 
-    async def send_log_message(self, guild_id: int, embed: discord.Embed):
-        """Send log message to configured webhook"""
-        config = self.get_guild_config(guild_id)
+    async def send_log_message(self, guild_id: int, embed: discord.Embed, view: Optional[discord.ui.View] = None):
+        """Send log message to configured webhook.
+
+        `view` may only contain link buttons — plain channel webhooks cannot
+        carry interactive components (discord.py enforces this via
+        view.is_dispatchable())."""
+        config = await self.get_guild_config(guild_id)
         webhook_url = config.get('member_log_webhook')
-        
-        if webhook_url:
+
+        if not webhook_url:
+            status_reporter.record("moderation", member_log_status="disabled")
+            return
+
+        view_kwargs = {"view": view} if view is not None else {}
+        try:
+            # Create a new aiohttp session for webhook requests
+            async with aiohttp.ClientSession() as session:
+                webhook = discord.Webhook.from_url(webhook_url, session=session)
+                # Read pb.png file and send it with the webhook
+                with open('pb.png', 'rb') as f:
+                    pb_file = discord.File(f, 'pb.png')
+                    await webhook.send(embed=embed, file=pb_file, avatar_url="attachment://pb.png", **view_kwargs)
+            status_reporter.record("moderation", member_log_status="ok", member_log_last_error=None)
+        except (discord.HTTPException, aiohttp.ClientError, FileNotFoundError):
+            # Fallback to sending without profile picture if pb.png is not found
             try:
-                # Create a new aiohttp session for webhook requests
                 async with aiohttp.ClientSession() as session:
                     webhook = discord.Webhook.from_url(webhook_url, session=session)
-                    # Read pb.png file and send it with the webhook
-                    with open('pb.png', 'rb') as f:
-                        pb_file = discord.File(f, 'pb.png')
-                        await webhook.send(embed=embed, file=pb_file, avatar_url="attachment://pb.png")
-            except (discord.HTTPException, aiohttp.ClientError, FileNotFoundError):
-                # Fallback to sending without profile picture if pb.png is not found
-                try:
-                    async with aiohttp.ClientSession() as session:
-                        webhook = discord.Webhook.from_url(webhook_url, session=session)
-                        await webhook.send(embed=embed)
-                except (discord.HTTPException, aiohttp.ClientError):
-                    pass  # Fail silently if webhook is invalid
+                    await webhook.send(embed=embed, **view_kwargs)
+                status_reporter.record("moderation", member_log_status="ok", member_log_last_error=None)
+            except (discord.HTTPException, aiohttp.ClientError) as e:
+                self.log.warning(f"Member-log webhook failed for guild {guild_id}: {e}")
+                status_reporter.record("moderation", member_log_status="error", member_log_last_error=str(e))
 
     async def check_for_kick(self, guild: discord.Guild, user_id: int):
         """Check audit logs for recent kick events"""
@@ -277,6 +281,18 @@ class ModerationCog(commands.Cog):
                         # Add to banned/kicked set and send kick embed
                         self.recently_banned_kicked.add(user_id)
                         status_reporter.bump_counter("moderation", "kicks")
+                        status_reporter.record_event(
+                            "moderation", "events",
+                            {
+                                "type": "kick",
+                                "user": str(entry.target),
+                                "user_id": entry.target.id,
+                                "moderator": str(entry.user) if entry.user else None,
+                                "reason": entry.reason,
+                                "guild": guild.name,
+                            },
+                            max_len=300,
+                        )
 
                         embed = self.create_kick_embed(entry.target, entry.user, entry.reason, guild)
                         await self.send_log_message(guild.id, embed)
@@ -289,31 +305,48 @@ class ModerationCog(commands.Cog):
     async def on_member_join(self, member: discord.Member):
         """Handle member join events"""
         status_reporter.bump_counter("moderation", "joins")
+        status_reporter.record_event(
+            "moderation", "events",
+            {"type": "join", "user": str(member), "user_id": member.id, "guild": member.guild.name},
+            max_len=300,
+        )
         # Store join time for duration calculation
         self.member_join_times[member.id] = datetime.now(timezone.utc)
         
         # Auto-assign role if configured
-        config = self.get_guild_config(member.guild.id)
+        config = await self.get_guild_config(member.guild.id)
         join_role_id = config.get('join_role')
         
         role_assigned = None
         role_name = None
         
-        if join_role_id:
+        if not join_role_id:
+            status_reporter.record("moderation", join_role_status="disabled")
+        else:
             role = member.guild.get_role(join_role_id)
             if role:
                 role_name = role.name
                 try:
                     await member.add_roles(role, reason="Auto-assigned join role")
                     role_assigned = True
-                except discord.Forbidden:
+                    status_reporter.record("moderation", join_role_status="ok", join_role_last_error=None)
+                except discord.Forbidden as e:
                     role_assigned = False  # Bot doesn't have permission
+                    self.log.warning(f"Failed to assign join role to {member} in guild {member.guild.id}: {e}")
+                    status_reporter.record("moderation", join_role_status="error", join_role_last_error=str(e))
             else:
                 role_assigned = False  # Role not found
-        
-        # Send log message with role assignment status (removed role_id parameter)
-        embed = self.create_join_embed(member, role_assigned=role_assigned, role_name=role_name)
-        await self.send_log_message(member.guild.id, embed)
+                self.log.warning(f"Join role {join_role_id} not found in guild {member.guild.id}")
+                status_reporter.record("moderation", join_role_status="error", join_role_last_error=f"role {join_role_id} not found")
+
+        # Send log message with role assignment status and a profile link button
+        embed = self.create_join_embed(member, role_assigned=role_assigned, role_name=role_name, role_id=join_role_id)
+        profile_view = discord.ui.View(timeout=None)
+        profile_view.add_item(discord.ui.Button(
+            style=discord.ButtonStyle.link, label="Profil",
+            url=f"https://discord.com/users/{member.id}",
+        ))
+        await self.send_log_message(member.guild.id, embed, view=profile_view)
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
@@ -328,6 +361,11 @@ class ModerationCog(commands.Cog):
             return
 
         status_reporter.bump_counter("moderation", "leaves")
+        status_reporter.record_event(
+            "moderation", "events",
+            {"type": "leave", "user": str(member), "user_id": member.id, "guild": member.guild.name},
+            max_len=300,
+        )
         # Calculate duration on server
         duration = None
         if member.id in self.member_join_times:
@@ -362,13 +400,27 @@ class ModerationCog(commands.Cog):
                     break
         except discord.Forbidden:
             pass
-        
+
+        status_reporter.record_event(
+            "moderation", "events",
+            {
+                "type": "ban",
+                "user": str(user),
+                "user_id": user.id,
+                "moderator": str(moderator) if moderator else None,
+                "reason": reason,
+                "guild": guild.name,
+            },
+            max_len=300,
+        )
+
         embed = self.create_ban_embed(user, moderator, reason, guild)
         await self.send_log_message(guild.id, embed)
 
     @commands.Cog.listener()
     async def on_member_unban(self, guild: discord.Guild, user: discord.User):
         """Handle member unban events"""
+        status_reporter.bump_counter("moderation", "unbans")
         # Try to get moderator from audit log
         moderator = None
         try:
@@ -378,7 +430,19 @@ class ModerationCog(commands.Cog):
                     break
         except discord.Forbidden:
             pass
-        
+
+        status_reporter.record_event(
+            "moderation", "events",
+            {
+                "type": "unban",
+                "user": str(user),
+                "user_id": user.id,
+                "moderator": str(moderator) if moderator else None,
+                "guild": guild.name,
+            },
+            max_len=300,
+        )
+
         embed = self.create_unban_embed(user, moderator, guild)
         await self.send_log_message(guild.id, embed)
 
@@ -404,7 +468,20 @@ class ModerationCog(commands.Cog):
                 # Calculate timeout duration
                 duration_delta = after.timed_out_until - datetime.now(timezone.utc)
                 duration = self.calculate_duration(datetime.now(timezone.utc) - duration_delta)
-                
+
+                status_reporter.record_event(
+                    "moderation", "events",
+                    {
+                        "type": "timeout",
+                        "user": str(after),
+                        "user_id": after.id,
+                        "moderator": str(moderator) if moderator else None,
+                        "reason": reason,
+                        "guild": after.guild.name,
+                    },
+                    max_len=300,
+                )
+
                 embed = self.create_timeout_embed(after, duration, moderator, reason)
                 await self.send_log_message(after.guild.id, embed)
 
@@ -415,10 +492,10 @@ class ModerationCog(commands.Cog):
         # Import here to avoid circular imports
         from core.mod_views import ModerationDashboardView
         
-        embed = self.create_dashboard_embed(interaction.guild.id)
+        embed = await self.create_dashboard_embed(interaction.guild.id)
         view = ModerationDashboardView(self)
-        view.update_buttons(interaction.guild.id)
-        
+        await view.update_buttons(interaction.guild.id)
+
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     @app_commands.command(name="clear", description="Delete a specified number of messages from the current channel")
@@ -485,23 +562,34 @@ class ModerationCog(commands.Cog):
         status_reporter.record("moderation", honeypot_loop_alive=True)
         guild = self.bot.get_guild(self.honeypot_guild_id)
         if not guild:
+            status_reporter.record("moderation", honeypot_status="error", honeypot_last_error="configured guild not found")
             return
 
-        config = self.get_guild_config(guild.id)
+        config = await self.get_guild_config(guild.id)
         honeypot_role_id = config.get('honeypot_role')
         if not honeypot_role_id:
+            status_reporter.record("moderation", honeypot_status="disabled")
             return
 
         role = guild.get_role(honeypot_role_id)
         if not role:
+            self.log.warning(f"Honeypot role {honeypot_role_id} not found in guild {guild.id}")
+            status_reporter.record("moderation", honeypot_status="error", honeypot_last_error=f"role {honeypot_role_id} not found")
             return
 
+        ban_error = None
         for member in list(role.members):
             try:
                 await guild.ban(member, reason="Autobann", delete_message_days=0)
                 status_reporter.bump_counter("moderation", "honeypot_bans")
-            except (discord.Forbidden, discord.HTTPException):
-                pass
+            except (discord.Forbidden, discord.HTTPException) as e:
+                ban_error = str(e)
+                self.log.warning(f"Honeypot ban failed for {member} in guild {guild.id}: {e}")
+
+        if ban_error:
+            status_reporter.record("moderation", honeypot_status="error", honeypot_last_error=ban_error)
+        else:
+            status_reporter.record("moderation", honeypot_status="ok", honeypot_last_error=None)
 
     @honeypot_ban_loop.before_loop
     async def before_honeypot_ban_loop(self):

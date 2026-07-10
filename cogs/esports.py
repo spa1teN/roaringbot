@@ -1,16 +1,13 @@
 """E-Sports Match Monitoring Cog for Discord Bot"""
 
 import asyncio
-import json
 import logging
 from datetime import datetime, timedelta, timezone, time
 from typing import Dict, List, Optional, Set, Tuple
-from pathlib import Path
 import pytz
 
 import discord
 from discord.ext import commands, tasks
-from discord import app_commands
 
 from core.config import config
 from core.http_client import http_client
@@ -42,9 +39,40 @@ class EsportsMatch:
             self.team_b = "TBA"
         else:
             self.team_b = lineup_b["team"].get("name", "TBA")
+        self.team_b_logo_url = (lineup_b or {}).get("team_logo_url")
         
-        self.start_time = datetime.fromisoformat(match_data["first_map_at"].replace('Z', '+00:00'))
-        self.end_time = datetime.fromisoformat(match_data["last_map_end"].replace('Z', '+00:00')) if match_data["last_map_end"] else None
+        # wannspieltbig.de's first_map_at consistently carries the German
+        # wall-clock digits as its literal value, regardless of what offset
+        # suffix accompanies it (verified live: always e.g. "+02:00", but the
+        # digits are what matter - confirmed against the site's own displayed
+        # match time). Discard the offset and reinterpret the naive wall-clock
+        # as Europe/Berlin; this is robust even if the API's own offset were
+        # ever wrong, since it never trusts that offset in the first place.
+        germany_tz = pytz.timezone("Europe/Berlin")
+
+        def _parse_wsb_local_time(raw: str) -> datetime:
+            naive = datetime.fromisoformat(raw.replace('Z', '+00:00')).replace(tzinfo=None)
+            return germany_tz.localize(naive).astimezone(timezone.utc)
+
+        self.start_time = _parse_wsb_local_time(match_data["first_map_at"])
+
+        # last_map_end is different: verified live, it always comes back with
+        # a genuine "Z" (real UTC) suffix, and is a coarse scheduling estimate
+        # (~start + 1h per best-of map), not a mislabeled local time. Trust
+        # its offset directly instead of reinterpreting the digits as Berlin
+        # local time - doing the latter (as a previous fix mistakenly did)
+        # shifts it ~2h earlier, making it look like it ends before it starts.
+        raw = match_data["last_map_end"]
+        raw_end_time = datetime.fromisoformat(raw.replace('Z', '+00:00')).astimezone(timezone.utc) if raw else None
+        # Still keep a sanity floor in case the API ever sends genuinely bad
+        # data - the reliable finished-detection is a match disappearing from
+        # the API response (see _handle_match_finished), not this field.
+        MIN_MATCH_DURATION = timedelta(minutes=15)
+        self.end_time = (
+            raw_end_time
+            if raw_end_time and raw_end_time >= self.start_time + MIN_MATCH_DURATION
+            else None
+        )
         self.cancelled = bool(match_data["cancelled"])
         self.detail_url = match_data["html_detail_url"]
         self.bestof = match_data["bestof"]
@@ -98,69 +126,7 @@ class EsportsMatch:
         slug = f"{self.team_a.lower().replace(' ', '-')}-vs-{self.team_b.lower().replace(' ', '-')}"
         return f"https://www.hltv.org/matches/{self.hltv_match_id}/{slug}"
     
-    def get_reminder_embed(self) -> discord.Embed:
-        """Create reminder embed for 30-minute notification"""
-        # Convert to German timezone for display
-        germany_tz = pytz.timezone("Europe/Berlin")
-        match_time_berlin = self.start_time.astimezone(germany_tz)
-        
-        # Use custom emotes for games
-        if self.game == "cs":
-            game_emoji = "<:cs:1416235161594499092>"
-        elif self.game == "lol":
-            game_emoji = "<:lol:1416235138307854416>"
-        elif self.game == "tm":
-            game_emoji = "🏎️"
-        else:
-            game_emoji = "🎮"
-        
-        game_name = {"cs": "Counter-Strike", "tm": "Trackmania", "lol": "League of Legends"}.get(self.game, self.game.upper())
-        
-        unix_ts = int(self.start_time.timestamp())
-
-        embed = discord.Embed(
-            title="⏰ Match Starting Soon!",
-            description=f"{game_emoji} **{self.team_a} vs {self.team_b}**",
-            color=0xff6b35,
-        )
-
-        embed.add_field(
-            name="🏆 Tournament",
-            value=self.tournament_name,
-            inline=True
-        )
-
-        embed.add_field(
-            name="🎮 Game",
-            value=f"{game_name} - Best of {self.bestof}",
-            inline=True
-        )
-
-        embed.add_field(
-            name="🕐 Start Time",
-            value=f"<t:{unix_ts}:t> (<t:{unix_ts}:R>)",
-            inline=True
-        )
-        
-        # Link to Discord event if available
-        if self.discord_event_id:
-            # We'll need to get the guild context to create the URL
-            embed.add_field(
-                name="📅 Discord Event",
-                value="Click on the Discord event for more details!",
-                inline=False
-            )
-        
-        links = f"[wannspieltbig.de]({self.detail_url})"
-        if self.game == "cs" and self.hltv_url:
-            links += f" • [HLTV]({self.hltv_url})"
-        embed.add_field(
-            name="🌐 Match Details",
-            value=links,
-            inline=False
-        )
-
-        return embed
+    # Rendering of the reminder message lives in build_reminder_view (CV2).
 
 
 class CSGameTracker:
@@ -177,6 +143,19 @@ class CSGameTracker:
         self.message_id: Optional[int] = None
         self.is_finished = False
         self.overtime_target = 13  # Current target score (13, 16, 19, 22, etc.)
+        # Display-only history of completed maps for the score message's map
+        # table: [{"map": 1, "name": "Mirage", "score": "13:9", "winner": "BIG"}].
+        # Not persisted — the 30s livescore sync rebuilds it from the API.
+        self.map_history: List[dict] = []
+
+    def map_name(self, map_nr: int) -> Optional[str]:
+        """Map name from the stored matchmaps data, if already known."""
+        idx = map_nr - 1
+        if 0 <= idx < len(self.match.matchmaps):
+            played = (self.match.matchmaps[idx] or {}).get("played_map")
+            if played:
+                return played.get("name")
+        return None
         
     @property
     def current_map_id(self) -> Optional[int]:
@@ -219,6 +198,14 @@ class CSGameTracker:
     
     def _finalize_map_completion(self):
         """Finalize the completion of current map (called after confirmation)"""
+        winner = self.get_winning_team()
+        if winner and not any(h["map"] == self.current_map for h in self.map_history):
+            self.map_history.append({
+                "map": self.current_map,
+                "name": self.map_name(self.current_map),
+                "score": f"{self.team_a_score}:{self.team_b_score}",
+                "winner": winner,
+            })
         maps_to_win = (self.match.bestof + 1) // 2
         if self.team_a_maps >= maps_to_win or self.team_b_maps >= maps_to_win:
             self.is_finished = True
@@ -268,207 +255,151 @@ class CSGameTracker:
         """Generate Discord event name with live score: 'BIG vs MIBR - 3:4 (1:0)'"""
         return f"{self.match.team_a} vs {self.match.team_b} - {self.team_a_score}:{self.team_b_score} ({self.team_a_maps}:{self.team_b_maps})"
 
-    def get_embed(self) -> discord.Embed:
-        """Create embed showing current game status"""
-        if self.is_finished:
-            winner = self.match.team_a if self.team_a_maps > self.team_b_maps else self.match.team_b
-            title = f"🏆 {winner} wins!"
-            color = 0x00ff00
+CS_EMOTE = "<:cs:1416235161594499092>"
+GAME_EMOJI = {"cs": CS_EMOTE, "lol": "<:lol:1416235138307854416>", "tm": "🏎️"}
+
+
+def build_reminder_view(match: "EsportsMatch", guild_id: Optional[int], mention: Optional[str] = None) -> discord.ui.LayoutView:
+    """CV2 reminder message: both team logos as a gallery, title with live
+    countdown, link buttons (Join Event / wannspieltbig / HLTV). Expects
+    big.png to be attached to the message (attachment://big.png)."""
+    unix_ts = int(match.start_time.timestamp())
+    game_emoji = GAME_EMOJI.get(match.game, "🎮")
+
+    container = discord.ui.Container(accent_colour=discord.Colour(0xFF6B35))
+
+    gallery = discord.ui.MediaGallery()
+    gallery.add_item(media="attachment://big.png")
+    if match.team_b_logo_url:
+        gallery.add_item(media=match.team_b_logo_url)
+    container.add_item(gallery)
+
+    container.add_item(discord.ui.TextDisplay(
+        f"## {match.team_a} vs {match.team_b} — <t:{unix_ts}:R>\n"
+        f"-# {game_emoji} {match.tournament_name} · Best of {match.bestof} · <t:{unix_ts}:t> Uhr"
+    ))
+    if mention:
+        container.add_item(discord.ui.TextDisplay(mention))
+
+    row = discord.ui.ActionRow()
+    if match.discord_event_id and guild_id:
+        row.add_item(discord.ui.Button(
+            style=discord.ButtonStyle.link, label="Join Event",
+            url=f"https://discord.com/events/{guild_id}/{match.discord_event_id}",
+        ))
+    row.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="wannspieltbig.de", url=match.detail_url))
+    if match.game == "cs" and match.hltv_url:
+        row.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="HLTV", url=match.hltv_url))
+    container.add_item(row)
+
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    return view
+
+
+def build_weekly_view(upcoming_matches: List["EsportsMatch"], week_start, week_end,
+                      guild: Optional[discord.Guild], germany_tz) -> discord.ui.LayoutView:
+    """CV2 weekly summary: header section with the (square-padded) BIG logo,
+    one block per day with event-linked match lines. Expects big_square.png
+    to be attached to the message."""
+    n = len(upcoming_matches)
+    header = (
+        f"## This Week ({week_start.strftime('%B %d')} - {(week_end - timedelta(days=1)).strftime('%B %d')})\n"
+        f"-# {n} match{'es' if n != 1 else ''} · Powered by [wannspieltbig.de](https://wannspieltbig.de)"
+    )
+
+    container = discord.ui.Container(accent_colour=discord.Colour(0x00FF88))
+    container.add_item(discord.ui.Section(
+        discord.ui.TextDisplay(header),
+        accessory=discord.ui.Thumbnail(media="attachment://big_square.png"),
+    ))
+    container.add_item(discord.ui.Separator())
+
+    if not upcoming_matches:
+        container.add_item(discord.ui.TextDisplay(
+            "**No Matches Scheduled**\nNo matches are scheduled for this week."))
+    else:
+        matches_by_day: Dict[str, List[str]] = {}
+        for match in upcoming_matches:
+            match_time = match.start_time.astimezone(germany_tz)
+            day_key = match_time.strftime("%A, %B %d")
+            game_emoji = GAME_EMOJI.get(match.game, "🎮")
+            label = f"{match_time.strftime('%H:%M')} - {match.team_a} vs {match.team_b}"
+            if match.discord_event_id and guild:
+                event_url = f"https://discord.com/events/{guild.id}/{match.discord_event_id}"
+                line = f"{game_emoji} **[{label}]({event_url})**"
+            else:
+                line = f"{game_emoji} **{label}**"
+            matches_by_day.setdefault(day_key, []).append(line)
+
+        days = list(matches_by_day.items())
+        for i, (day, lines) in enumerate(days):
+            container.add_item(discord.ui.TextDisplay(f"### {day}\n" + "\n".join(lines)))
+            if i < len(days) - 1:
+                container.add_item(discord.ui.Separator())
+
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    return view
+
+
+def _score_map_table(tracker: "CSGameTracker") -> str:
+    """Monospace map table: 'Map 1  Mirage   13 : 9   ✓ BIG' per best-of slot."""
+    history = {h["map"]: h for h in tracker.map_history}
+    names = []
+    for nr in range(1, tracker.match.bestof + 1):
+        names.append((history.get(nr) or {}).get("name") or tracker.map_name(nr) or "TBA")
+    name_width = max([len(n) for n in names] + [7])
+
+    rows = []
+    for nr in range(1, tracker.match.bestof + 1):
+        h = history.get(nr)
+        if h:
+            a, b = h["score"].split(":")
+            score = f"{int(a):>2} : {int(b):<2}"
+            status = f"✓ {h['winner']}"
+        elif not tracker.is_finished and nr == tracker.current_map:
+            score = f"{tracker.team_a_score:>2} : {tracker.team_b_score:<2}"
+            status = "● live"
+            if tracker.overtime_target > 13:
+                status += f" (first to {tracker.overtime_target})"
         else:
-            title = f"🔴 LIVE: {self.match.team_a} vs {self.match.team_b}"
-            color = 0xff0000
-        
-        embed = discord.Embed(
-            title=title,
-            description=f"**{self.match.tournament_name}**\n<:cs:1416235161594499092> Counter-Strike • Best of {self.match.bestof}",
-            color=color,
-            timestamp=datetime.utcnow()
-        )
-        
-        # Overall map score
-        embed.add_field(
-            name="Maps",
-            value=f"**{self.team_a_maps} - {self.team_b_maps}**",
-            inline=True
-        )
-        
-        if not self.is_finished:
-            # Current map score with overtime indication
-            required_score = self._get_required_score_to_win()
-            
-            map_status = f"Map {self.current_map}"
-            score_text = f"**{self.team_a_score} - {self.team_b_score}**"
-            
-            # Show overtime status when target is above 13
-            if required_score > 13:
-                if required_score == 16:
-                    map_status += " (OT1)"
-                elif required_score == 19:
-                    map_status += " (OT2)"  
-                elif required_score == 22:
-                    map_status += " (OT3)"
-                elif required_score > 22:
-                    ot_num = (required_score - 13) // 3
-                    map_status += f" (OT{ot_num})"
-                
-                score_text += f"\nFirst to {required_score}"
-            
-            embed.add_field(
-                name=map_status,
-                value=score_text,
-                inline=True
-            )
-        
-        embed.add_field(
-            name="Teams",
-            value=f"**{self.match.team_a}** vs **{self.match.team_b}**",
-            inline=False
-        )
-
-        links = f"[wannspieltbig.de]({self.match.detail_url})"
-        if self.match.hltv_url:
-            links += f" • [HLTV]({self.match.hltv_url})"
-        embed.add_field(name="🌐 Links", value=links, inline=False)
-
-        if not self.is_finished:
-            embed.set_footer(text="Click buttons below to update scores")
-        else:
-            embed.set_footer(text="Match finished")
-
-        return embed
-    
-    def get_reminder_embed(self) -> discord.Embed:
-        """Create reminder embed for 30-minute notification"""
-        # Convert to German timezone for display
-        germany_tz = pytz.timezone("Europe/Berlin")
-        match_time_berlin = self.start_time.astimezone(germany_tz)
-        
-        # Use custom emotes for games
-        if self.game == "cs":
-            game_emoji = "<:cs:1416235161594499092>"
-        elif self.game == "lol":
-            game_emoji = "<:lol:1416235138307854416>"
-        elif self.game == "tm":
-            game_emoji = "🏎️"
-        else:
-            game_emoji = "🎮"
-        
-        game_name = {"cs": "Counter-Strike", "tm": "Trackmania", "lol": "League of Legends"}.get(self.game, self.game.upper())
-        
-        unix_ts = int(self.start_time.timestamp())
-
-        embed = discord.Embed(
-            title="⏰ Match Starting Soon!",
-            description=f"{game_emoji} **{self.team_a} vs {self.team_b}**",
-            color=0xff6b35,
-        )
-
-        embed.add_field(
-            name="🏆 Tournament",
-            value=self.tournament_name,
-            inline=True
-        )
-
-        embed.add_field(
-            name="🎮 Game",
-            value=f"{game_name} - Best of {self.bestof}",
-            inline=True
-        )
-
-        embed.add_field(
-            name="🕐 Start Time",
-            value=f"<t:{unix_ts}:t> (<t:{unix_ts}:R>)",
-            inline=True
-        )
-        
-        # Link to Discord event if available
-        if self.discord_event_id:
-            # We'll need to get the guild context to create the URL
-            embed.add_field(
-                name="📅 Discord Event",
-                value="Click on the Discord event for more details!",
-                inline=False
-            )
-        
-        embed.add_field(
-            name="🌐 Match Details",
-            value=f"[View on wannspieltbig.de]({self.detail_url})",
-            inline=False
-        )
-                
-        return embed
+            score = " – : – "
+            status = ""
+        rows.append(f"Map {nr}  {names[nr - 1]:<{name_width}}  {score}  {status}".rstrip())
+    return "\n".join(rows)
 
 
-class MatchSelectionView(discord.ui.View):
-    """View for selecting upcoming CS matches to track"""
-    
-    def __init__(self, cs_matches: List[EsportsMatch], esports_cog):
-        super().__init__(timeout=300)  # 5 minutes timeout
-        self.cs_matches = cs_matches
-        self.esports_cog = esports_cog
-        
-        # Add buttons for each CS match (max 25 per view)
-        for i, match in enumerate(cs_matches[:25]):
-            # Create button label with team names and start time
-            match_time = match.start_time.strftime("%H:%M")
-            button_label = f"{match.team_a} vs {match.team_b} ({match_time})"
-            
-            # Truncate label if too long
-            if len(button_label) > 80:
-                button_label = button_label[:77] + "..."
-            
-            button = discord.ui.Button(
-                label=button_label,
-                style=discord.ButtonStyle.primary,
-                custom_id=f"select_match_{match.id}",
-                row=i // 5  # 5 buttons per row
-            )
-            button.callback = self.create_match_callback(match)
-            self.add_item(button)
-    
-    def create_match_callback(self, match: EsportsMatch):
-        """Create callback function for a specific match button"""
-        async def match_callback(interaction: discord.Interaction):
-            if not interaction.user.guild_permissions.administrator:
-                await interaction.response.send_message("❌ Only administrators can start CS tracking.", ephemeral=True)
-                return
-            
-            # Check if tracking is already active
-            if match.id in self.esports_cog.active_cs_games:
-                await interaction.response.send_message(f"❌ CS tracking already active for this match.", ephemeral=True)
-                return
-            
-            await interaction.response.defer()
-            
-            try:
-                await self.esports_cog._start_cs_game_tracking(match)
-                await interaction.followup.send(
-                    f"✅ Started CS game tracking for {match.team_a} vs {match.team_b}",
-                    ephemeral=True
-                )
-                # Edit original message to show selection was made
-                embed = discord.Embed(
-                    title="✅ CS Game Tracking Started",
-                    description=f"Now tracking: **{match.team_a} vs {match.team_b}**",
-                    color=0x00ff00
-                )
-                await interaction.edit_original_response(embed=embed, view=None)
-            except Exception as e:
-                await interaction.followup.send(f"❌ Error starting CS tracking: {e}", ephemeral=True)
-        
-        return match_callback
+def build_score_container(tracker: "CSGameTracker") -> discord.ui.Container:
+    """Components-V2 rendering of the score message (cosmetic replacement for
+    the old embed — same information, same update flow)."""
+    m = tracker.match
+    header = f"-# {CS_EMOTE} {m.tournament_name} · Best of {m.bestof} · [wannspieltbig.de]({m.detail_url})"
+    if m.hltv_url:
+        header += f" · [HLTV]({m.hltv_url})"
+
+    if tracker.is_finished:
+        winner = m.team_a if tracker.team_a_maps > tracker.team_b_maps else m.team_b
+        title = f"## 🏆 {winner} wins!  ·  Maps {tracker.team_a_maps} : {tracker.team_b_maps}"
+    else:
+        title = f"## {m.team_a}  {tracker.team_a_score} : {tracker.team_b_score}  {m.team_b}"
+
+    container = discord.ui.Container(accent_colour=discord.Colour(0x57F287))
+    container.add_item(discord.ui.TextDisplay(header))
+    container.add_item(discord.ui.TextDisplay(title))
+    container.add_item(discord.ui.TextDisplay(f"```\n{_score_map_table(tracker)}\n```"))
+    return container
 
 
-class MapConfirmationView(discord.ui.View):
-    """View for confirming map completion"""
-    
+class MapConfirmationView(discord.ui.LayoutView):
+    """Score message with confirm/cancel buttons for map completion (CV2)"""
+
     def __init__(self, tracker: CSGameTracker, esports_cog, winning_team: str):
         super().__init__(timeout=300)  # 5 minutes timeout
         self.tracker = tracker
         self.esports_cog = esports_cog
         self.winning_team = winning_team
-        
-        # Create confirmation buttons
+
         self.confirm_button = discord.ui.Button(
             label=f"Confirm: {winning_team} wins Map {tracker.current_map}",
             style=discord.ButtonStyle.green,
@@ -479,13 +410,14 @@ class MapConfirmationView(discord.ui.View):
             style=discord.ButtonStyle.red,
             custom_id=f"cancel_map_{tracker.match.id}"
         )
-        
         self.confirm_button.callback = self.confirm_callback
         self.cancel_button.callback = self.cancel_callback
-        
-        self.add_item(self.confirm_button)
-        self.add_item(self.cancel_button)
-    
+
+        container = build_score_container(tracker)
+        container.add_item(discord.ui.Separator())
+        container.add_item(discord.ui.ActionRow(self.confirm_button, self.cancel_button))
+        self.add_item(container)
+
     async def confirm_callback(self, interaction: discord.Interaction):
         """Confirm the map is finished"""
         if not interaction.user.guild_permissions.administrator:
@@ -499,9 +431,7 @@ class MapConfirmationView(discord.ui.View):
             await self.esports_cog._update_score_api(self.tracker)
             await self.esports_cog._update_event_name_with_score(self.tracker)
 
-            embed = self.tracker.get_embed()
-            view = None if self.tracker.is_finished else ScoreUpdateView(self.tracker, self.esports_cog)
-            await interaction.response.edit_message(embed=embed, view=view)
+            await interaction.response.edit_message(view=ScoreUpdateView(self.tracker, self.esports_cog))
         except Exception as e:
             self.esports_cog.log.error(f"Button error (confirm_map, match {self.tracker.match.id}): {e}", exc_info=True)
             await interaction.response.send_message(f"❌ Error confirming map: {e}", ephemeral=True)
@@ -516,9 +446,7 @@ class MapConfirmationView(discord.ui.View):
         self.esports_cog.log.info(f"Button: {interaction.user} cancelled map {self.tracker.current_map} confirmation (match {self.tracker.match.id}) - continuing play")
         self.tracker._revert_map_completion()
 
-        embed = self.tracker.get_embed()
-        view = ScoreUpdateView(self.tracker, self.esports_cog)
-        await interaction.response.edit_message(embed=embed, view=view)
+        await interaction.response.edit_message(view=ScoreUpdateView(self.tracker, self.esports_cog))
 
 
 class ManualScoreModal(discord.ui.Modal):
@@ -587,11 +515,10 @@ class ManualScoreModal(discord.ui.Modal):
                     self.tracker.team_a_maps += 1
                 elif winning_team == self.tracker.match.team_b:
                     self.tracker.team_b_maps += 1
-                
-                embed = self.tracker.get_embed()
+
                 view = MapConfirmationView(self.tracker, self.esports_cog, winning_team)
-                await interaction.response.edit_message(embed=embed, view=view)
-                
+                await interaction.response.edit_message(view=view)
+
                 # Send confirmation as followup
                 await interaction.followup.send(
                     f"✅ Score updated: {old_team_a_score}-{old_team_b_score} → {team_a_rounds}-{team_b_rounds}\n🏆 {winning_team} reached winning score!",
@@ -599,10 +526,9 @@ class ManualScoreModal(discord.ui.Modal):
                 )
             else:
                 # Update the message with normal view
-                embed = self.tracker.get_embed()
                 view = ScoreUpdateView(self.tracker, self.esports_cog)
-                await interaction.response.edit_message(embed=embed, view=view)
-                
+                await interaction.response.edit_message(view=view)
+
                 # Send confirmation as followup
                 await interaction.followup.send(
                     f"✅ Score updated: {old_team_a_score}-{old_team_b_score} → {team_a_rounds}-{team_b_rounds}",
@@ -616,46 +542,45 @@ class ManualScoreModal(discord.ui.Modal):
             await interaction.response.send_message(f"❌ Error updating score: {e}", ephemeral=True)
 
 
-class ScoreUpdateView(discord.ui.View):
-    """View with buttons for updating CS game scores"""
-    
+class ScoreUpdateView(discord.ui.LayoutView):
+    """The score message itself (CV2 container) plus round-update buttons.
+    When the tracker is finished, it renders the winner state without buttons."""
+
     def __init__(self, tracker: CSGameTracker, esports_cog):
         super().__init__(timeout=21600)  # 6 hours timeout
         self.tracker = tracker
         self.esports_cog = esports_cog
-        
-        # Create buttons with team names
-        self.team_a_button = discord.ui.Button(
-            label=f"{tracker.match.team_a} won round",
-            style=discord.ButtonStyle.primary,
-            custom_id=f"team_a_{tracker.match.id}"
-        )
-        self.team_b_button = discord.ui.Button(
-            label=f"{tracker.match.team_b} won round",
-            style=discord.ButtonStyle.primary,
-            custom_id=f"team_b_{tracker.match.id}"
-        )
-        self.manual_score_button = discord.ui.Button(
-            label="Set Score Manually",
-            style=discord.ButtonStyle.secondary,
-            custom_id=f"manual_{tracker.match.id}",
-            emoji="📝"
-        )
-        
-        self.team_a_button.callback = self.team_a_callback
-        self.team_b_button.callback = self.team_b_callback
-        self.manual_score_button.callback = self.manual_score_callback
-        
-        self.add_item(self.team_a_button)
-        self.add_item(self.team_b_button)
-        self.add_item(self.manual_score_button)
-        
-        # Disable buttons if match is finished
-        if tracker.is_finished:
-            self.team_a_button.disabled = True
-            self.team_b_button.disabled = True
-            self.manual_score_button.disabled = True
-    
+
+        container = build_score_container(tracker)
+
+        if not tracker.is_finished:
+            self.team_a_button = discord.ui.Button(
+                label=f"{tracker.match.team_a} won round",
+                style=discord.ButtonStyle.success,
+                custom_id=f"team_a_{tracker.match.id}"
+            )
+            self.team_b_button = discord.ui.Button(
+                label=f"{tracker.match.team_b} won round",
+                style=discord.ButtonStyle.danger,
+                custom_id=f"team_b_{tracker.match.id}"
+            )
+            self.manual_score_button = discord.ui.Button(
+                label="Set Score Manually",
+                style=discord.ButtonStyle.secondary,
+                custom_id=f"manual_{tracker.match.id}",
+                emoji="📝"
+            )
+            self.team_a_button.callback = self.team_a_callback
+            self.team_b_button.callback = self.team_b_callback
+            self.manual_score_button.callback = self.manual_score_callback
+
+            container.add_item(discord.ui.Separator())
+            container.add_item(discord.ui.ActionRow(self.team_a_button, self.team_b_button, self.manual_score_button))
+        else:
+            container.add_item(discord.ui.TextDisplay("-# Match finished"))
+
+        self.add_item(container)
+
     async def team_a_callback(self, interaction: discord.Interaction):
         """Handle team A round win"""
         if not interaction.user.guild_permissions.administrator:
@@ -673,12 +598,10 @@ class ScoreUpdateView(discord.ui.View):
                 winning_team = self.tracker.get_winning_team()
                 if winning_team == self.tracker.match.team_a:
                     self.tracker.team_a_maps += 1
-                embed = self.tracker.get_embed()
                 view = MapConfirmationView(self.tracker, self.esports_cog, winning_team)
-                await interaction.response.edit_message(embed=embed, view=view)
+                await interaction.response.edit_message(view=view)
             else:
-                embed = self.tracker.get_embed()
-                await interaction.response.edit_message(embed=embed, view=self)
+                await interaction.response.edit_message(view=ScoreUpdateView(self.tracker, self.esports_cog))
         except Exception as e:
             self.esports_cog.log.error(f"Button error (team_a, match {self.tracker.match.id}): {e}", exc_info=True)
             await interaction.response.send_message(f"❌ Error updating score: {e}", ephemeral=True)
@@ -700,12 +623,10 @@ class ScoreUpdateView(discord.ui.View):
                 winning_team = self.tracker.get_winning_team()
                 if winning_team == self.tracker.match.team_b:
                     self.tracker.team_b_maps += 1
-                embed = self.tracker.get_embed()
                 view = MapConfirmationView(self.tracker, self.esports_cog, winning_team)
-                await interaction.response.edit_message(embed=embed, view=view)
+                await interaction.response.edit_message(view=view)
             else:
-                embed = self.tracker.get_embed()
-                await interaction.response.edit_message(embed=embed, view=self)
+                await interaction.response.edit_message(view=ScoreUpdateView(self.tracker, self.esports_cog))
         except Exception as e:
             self.esports_cog.log.error(f"Button error (team_b, match {self.tracker.match.id}): {e}", exc_info=True)
             await interaction.response.send_message(f"❌ Error updating score: {e}", ephemeral=True)
@@ -737,94 +658,74 @@ class EsportsCog(commands.Cog):
         self.thread_to_match: Dict[int, int] = {}  # Forum thread ID -> match ID
         self.event_start_failures: Dict[int, int] = {}  # event ID -> consecutive failure count
         self.event_not_found_count: Dict[int, int] = {}  # event ID -> consecutive NotFound count
+        self._event_status_by_match: Dict[int, discord.EventStatus] = {}  # match ID -> last observed Discord event status (this poll)
         self.summary_message_id: Optional[int] = None  # Latest summary message ID
-        self.storage_file = Path("config/esports_data.json")
-        
+
         # CS game tracking
         self.active_cs_games: Dict[int, CSGameTracker] = {}  # match ID -> tracker
         self.monitored_matches: Set[int] = set()  # Matches currently being monitored for start time
-        self._pending_tracker_restore: Dict[int, dict] = {}  # Loaded from JSON, applied after first API poll
-        
+        self._pending_tracker_restore: Dict[int, dict] = {}  # Loaded from DB, applied after first API poll
+
         # German timezone for weekly summary scheduling
         self.germany_tz = pytz.timezone("Europe/Berlin")
-        
-        # Load persisted data
-        self._load_data()
-        
+
+        # Persisted data is loaded in cog_load (needs the DB connection, which
+        # isn't ready yet during __init__)
+
         # Start polling if enabled
         if config.esports_enabled:
             self.log.info("E-Sports monitoring enabled")
         else:
             self.log.info("E-Sports monitoring disabled")
-    
-    def _load_data(self):
-        """Load persisted match and event data"""
+
+    async def _load_data(self):
+        """Load persisted match and event data from Postgres"""
         try:
-            if self.storage_file.exists():
-                with open(self.storage_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
+            data = await self.bot.db.esports.load_all()
 
-                # Reconstruct event mappings
-                self.event_to_match = {int(k): v for k, v in data.get("event_to_match", {}).items()}
+            self.event_to_match = data["event_to_match"]
+            self.reminder_to_match = data["reminder_to_match"]
+            self.thread_to_match = data["thread_to_match"]
+            self.summary_message_id = data["summary_message_id"]
+            self.monitored_matches = set(data["monitored_matches"])
+            self.known_match_ids = set(data["known_match_ids"])
+            self._pending_tracker_restore = {
+                int(k): v for k, v in data["active_cs_trackers"].items()
+            }
 
-                # Reconstruct reminder mappings
-                self.reminder_to_match = {int(k): v for k, v in data.get("reminder_to_match", {}).items()}
-                self.thread_to_match = {int(k): v for k, v in data.get("thread_to_match", {}).items()}
-
-                # Load summary message ID
-                self.summary_message_id = data.get("summary_message_id")
-
-                # Load monitored matches
-                self.monitored_matches = set(data.get("monitored_matches", []))
-
-                # Load known match IDs to prevent duplicate event creation on restart
-                self.known_match_ids = set(data.get("known_match_ids", []))
-
-                # Load pending tracker restorations (applied after first API poll)
-                self._pending_tracker_restore = {
-                    int(k): v for k, v in data.get("active_cs_trackers", {}).items()
-                }
-
-                self.log.info(f"Loaded {len(self.event_to_match)} event mappings and {len(self.monitored_matches)} monitored matches")
-                if self._pending_tracker_restore:
-                    self.log.info(f"Pending CS tracker restore for {len(self._pending_tracker_restore)} match(es)")
+            self.log.info(f"Loaded {len(self.event_to_match)} event mappings and {len(self.monitored_matches)} monitored matches")
+            if self._pending_tracker_restore:
+                self.log.info(f"Pending CS tracker restore for {len(self._pending_tracker_restore)} match(es)")
         except Exception as e:
             self.log.error(f"Error loading esports data: {e}")
-    
-    def _save_data(self):
-        """Save current match and event data"""
+
+    async def _save_data(self):
+        """Bulk-resync current match and event data to Postgres"""
         try:
-            self.storage_file.parent.mkdir(parents=True, exist_ok=True)
-
-            # Serialize active CS trackers so they survive restarts
-            active_cs_trackers = {}
-            for match_id, tracker in self.active_cs_games.items():
-                if not tracker.is_finished and tracker.message_id:
-                    active_cs_trackers[str(match_id)] = {
-                        "message_id": tracker.message_id,
-                        "current_map": tracker.current_map,
-                        "team_a_score": tracker.team_a_score,
-                        "team_b_score": tracker.team_b_score,
-                        "team_a_maps": tracker.team_a_maps,
-                        "team_b_maps": tracker.team_b_maps,
-                        "overtime_target": tracker.overtime_target,
-                        "match_maps": tracker.match_maps,
-                    }
-
-            data = {
-                "event_to_match": self.event_to_match,
-                "reminder_to_match": self.reminder_to_match,
-                "thread_to_match": self.thread_to_match,
-                "summary_message_id": self.summary_message_id,
-                "monitored_matches": list(self.monitored_matches),
-                "known_match_ids": list(self.matches.keys()),
-                "active_cs_trackers": active_cs_trackers,
-                "last_update": datetime.now().isoformat()
+            active_cs_trackers = {
+                match_id: {
+                    "message_id": tracker.message_id,
+                    "current_map": tracker.current_map,
+                    "team_a_score": tracker.team_a_score,
+                    "team_b_score": tracker.team_b_score,
+                    "team_a_maps": tracker.team_a_maps,
+                    "team_b_maps": tracker.team_b_maps,
+                    "overtime_target": tracker.overtime_target,
+                    "match_maps": tracker.match_maps,
+                }
+                for match_id, tracker in self.active_cs_games.items()
+                if not tracker.is_finished and tracker.message_id
             }
-            
-            with open(self.storage_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-                
+
+            await self.bot.db.esports.save_all(
+                event_to_match=self.event_to_match,
+                reminder_to_match=self.reminder_to_match,
+                thread_to_match=self.thread_to_match,
+                summary_message_id=self.summary_message_id,
+                monitored_matches=self.monitored_matches,
+                known_match_ids=set(self.matches.keys()),
+                active_cs_trackers=active_cs_trackers,
+            )
         except Exception as e:
             self.log.error(f"Error saving esports data: {e}")
 
@@ -862,16 +763,17 @@ class EsportsCog(commands.Cog):
 
     async def cog_load(self):
         """Called when the cog is loaded"""
+        await self._load_data()
         if config.esports_enabled:
             self.match_monitor.start()
             self.live_score_updater.start()
             self.log.info("Started e-sports monitoring tasks")
-    
-    def cog_unload(self):
+
+    async def cog_unload(self):
         """Called when the cog is unloaded"""
         self.match_monitor.cancel()
         self.live_score_updater.cancel()
-        self._save_data()
+        await self._save_data()
         self.log.info("Stopped e-sports monitoring tasks")
 
     @commands.Cog.listener()
@@ -893,7 +795,7 @@ class EsportsCog(commands.Cog):
             for eid in stale:
                 mid = self.event_to_match.pop(eid)
                 self.log.info(f"Removed stale event_to_match entry on startup: event {eid} -> match {mid}")
-            self._save_data()
+            await self._save_data()
 
     @commands.Cog.listener()
     async def on_resumed(self):
@@ -915,9 +817,7 @@ class EsportsCog(commands.Cog):
                 continue
             try:
                 message = await channel.fetch_message(tracker.message_id)
-                embed = tracker.get_embed()
-                view = ScoreUpdateView(tracker, self)
-                await message.edit(embed=embed, view=view)
+                await message.edit(view=ScoreUpdateView(tracker, self))
                 self.log.info(f"Refreshed score message for match {match_id} after RESUME")
             except discord.NotFound:
                 self.log.warning(f"Score message {tracker.message_id} not found during RESUME refresh")
@@ -1034,10 +934,25 @@ class EsportsCog(commands.Cog):
 
             now = datetime.now(timezone.utc)
             week_end = now + timedelta(days=7)
+            live_grace = now - timedelta(hours=6)  # assume still running if started recently and no end_time yet
+
+            def _is_current_or_upcoming(m: "EsportsMatch", horizon=None) -> bool:
+                if m.cancelled or (horizon is not None and m.start_time > horizon):
+                    return False
+                if m.end_time is not None:
+                    return m.end_time >= now
+                return m.start_time >= live_grace
+
             upcoming = sorted(
-                (m for m in self.matches.values() if not m.cancelled and now <= m.start_time <= week_end),
+                (m for m in self.matches.values() if _is_current_or_upcoming(m, week_end)),
                 key=lambda m: m.start_time,
             )
+            # The dashboard's next-matches strip is NOT week-capped: always the
+            # next three live/upcoming matches, however far out they are.
+            next_three = sorted(
+                (m for m in self.matches.values() if _is_current_or_upcoming(m)),
+                key=lambda m: m.start_time,
+            )[:3]
 
             status_reporter.record(
                 "esports",
@@ -1048,17 +963,24 @@ class EsportsCog(commands.Cog):
                 total_matches=len(self.matches),
                 active_matches=len([m for m in self.matches.values() if not m.cancelled]),
                 active_discord_events=len(self.event_to_match),
+                scheduled_matches=len(upcoming),
+                scheduled_discord_events=len([m for m in upcoming if m.discord_event_id]),
                 active_cs_trackers=len(self.active_cs_games),
                 summary_message_id=self.summary_message_id,
                 upcoming_matches=[
                     {
+                        "match_id": m.id,
                         "teams": f"{m.team_a} vs. {m.team_b}",
                         "tournament": m.tournament_name,
                         "game": m.game,
                         "start_time": m.start_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "end_time": m.end_time.strftime("%Y-%m-%dT%H:%M:%SZ") if m.end_time else None,
+                        "bestof": m.bestof,
+                        "detail_url": m.detail_url,
                     }
                     for m in upcoming
                 ],
+                next_matches=self._compute_next_matches(next_three, now),
             )
 
         except Exception as e:
@@ -1128,6 +1050,7 @@ class EsportsCog(commands.Cog):
                 team_a_maps = 0
                 team_b_maps = 0
                 current_map_idx = 0
+                api_history = []  # completed maps, feeds the score message's map table
 
                 for i, mm in enumerate(matchmaps):
                     rounds_a = mm.get("rounds_won_team_a", 0) or 0
@@ -1161,7 +1084,18 @@ class EsportsCog(commands.Cog):
                         current_map_idx = i
                         break
                     else:
+                        api_history.append({
+                            "map": i + 1,
+                            "name": (mm.get("played_map") or {}).get("name"),
+                            "score": f"{rounds_a}:{rounds_b}",
+                            "winner": tracker.match.team_a if rounds_a > rounds_b else tracker.match.team_b,
+                        })
                         current_map_idx = i + 1
+
+                # API is the source of truth for completed maps (also restores
+                # the display-only history after a bot restart)
+                if api_history:
+                    tracker.map_history = api_history
 
                 scores_changed = False
 
@@ -1215,8 +1149,8 @@ class EsportsCog(commands.Cog):
 
                             if match_finished and not tracker.is_finished:
                                 tracker.is_finished = True
-                                embed = tracker.get_embed()  # This shows winner embed when is_finished=True
-                                await message.edit(embed=embed, view=None)
+                                # Winner rendering, no buttons (is_finished=True)
+                                await message.edit(view=ScoreUpdateView(tracker, self))
                                 self.log.info(f"Match {match_id} finished via API sync - "
                                              f"{tracker.match.team_a} {tracker.team_a_maps}-{tracker.team_b_maps} {tracker.match.team_b}")
 
@@ -1226,9 +1160,7 @@ class EsportsCog(commands.Cog):
                                 # Remove from active games
                                 del self.active_cs_games[match_id]
                             else:
-                                embed = tracker.get_embed()
-                                view = ScoreUpdateView(tracker, self)
-                                await message.edit(embed=embed, view=view)
+                                await message.edit(view=ScoreUpdateView(tracker, self))
                     except discord.NotFound:
                         self.log.warning(f"Score update message {tracker.message_id} not found")
                         if match_id in self.active_cs_games:
@@ -1304,25 +1236,44 @@ class EsportsCog(commands.Cog):
         except Exception as e:
             self.log.error(f"Error ending match event: {e}")
 
+    def _record_match_event(self, match: "EsportsMatch", event_type: str):
+        """Append a match lifecycle event for the dashboard's E-Sports timeline (see DATA_INTERFACE.md)."""
+        status_reporter.record_event(
+            "esports",
+            "match_events",
+            {
+                "type": event_type,
+                "match_id": match.id,
+                "teams": match.event_name,
+                "tournament": match.tournament_name,
+                "game": match.game,
+                "start_time": match.start_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "bestof": match.bestof,
+                "detail_url": match.detail_url,
+            },
+            max_len=200,
+        )
+
     async def _process_match_updates(self, current_matches: Dict[int, EsportsMatch]):
         """Process match updates and manage Discord events"""
-        
+
         # Handle matches that disappeared from API (finished matches)
         for match_id, old_match in self.matches.items():
             if match_id not in current_matches:
                 # Match disappeared from API - likely finished
                 await self._handle_match_finished(old_match)
-        
+
         # Handle cancelled matches
         for match_id, old_match in self.matches.items():
             if match_id in current_matches:
                 new_match = current_matches[match_id]
                 if new_match.cancelled and not old_match.cancelled:
                     await self._handle_match_cancelled(new_match)
-        
+
         # Handle new and updated matches
         for match_id, match in current_matches.items():
             if match_id not in self.matches and match_id not in self.known_match_ids:
+                self._record_match_event(match, "created")
                 # Genuinely new match - check if event already exists before creating
                 if not match.cancelled and not match.discord_event_id:
                     await self._create_discord_event(match)
@@ -1348,7 +1299,7 @@ class EsportsCog(commands.Cog):
         
         # Update our local cache
         self.matches = current_matches
-        self._save_data()
+        await self._save_data()
 
         # Restore CS trackers from JSON after first API poll (matches are now populated)
         if self._pending_tracker_restore:
@@ -1365,7 +1316,106 @@ class EsportsCog(commands.Cog):
             old_match.team_b != new_match.team_b or
             old_match.tournament_name != new_match.tournament_name
         )
-    
+
+    EVENT_START_LEAD = timedelta(minutes=5)
+
+    def _event_target_start(self, match: "EsportsMatch") -> datetime:
+        """The Discord event should go live 5 minutes before the real kickoff.
+        Clamped to a few seconds in the future so Discord's API (which rejects
+        a past/immediate start_time) never errors out for matches discovered
+        with less than 5 minutes' notice.
+        """
+        target = match.start_time - self.EVENT_START_LEAD
+        floor = datetime.now(timezone.utc) + timedelta(seconds=30)
+        return max(target, floor)
+
+    def _event_end_time(self, match: "EsportsMatch") -> datetime:
+        """Sensible scheduled end time: the (correctly parsed) API estimate
+        from last_map_end if present, else start + 1h per best-of map —
+        mirrors the API's own apparent estimation formula. Always relative
+        to the real kickoff, not the 5-minutes-early event start.
+        """
+        return match.end_time or (match.start_time + timedelta(hours=max(1, match.bestof)))
+
+    def _match_health_issues(self, match: "EsportsMatch", now: datetime) -> List[str]:
+        """Detect and log discrepancies between what should exist for an
+        upcoming/live match and what actually does — surfaced to the
+        dashboard's E-Sports status boxes so problems aren't silent."""
+        issues = []
+
+        if not match.discord_event_id:
+            issues.append("no_discord_event")
+
+        time_to_start = (match.start_time - now).total_seconds()
+        reminder_ok = bool(match.reminder_message_id or match.forum_thread_id)
+        if time_to_start <= 1800 and not reminder_ok:
+            issues.append("reminder_missing")
+
+        if match.discord_event_id and now >= self._event_target_start(match):
+            status = self._event_status_by_match.get(match.id)
+            if status == discord.EventStatus.scheduled:
+                issues.append("event_not_started")
+
+        if match.game == "cs" and now >= match.start_time - timedelta(minutes=5) and match.id not in self.active_cs_games:
+            still_relevant = match.end_time is None or now < match.end_time + timedelta(hours=1)
+            if still_relevant:
+                issues.append("tracking_missing")
+
+        if issues:
+            self.log.error(f"Match {match.id} ({match.event_name}) health issues: {', '.join(issues)}")
+        return issues
+
+    def _compute_next_matches(self, matches: List["EsportsMatch"], now: datetime) -> list:
+        """Build the dashboard's next-3-matches status list, see DATA_INTERFACE.md."""
+        result = []
+        for m in matches:
+            is_live = m.start_time <= now and (m.end_time is None or m.end_time >= now)
+            issues = self._match_health_issues(m, now)
+
+            reminder_at = m.start_time - timedelta(minutes=30)
+            reminder_ok = bool(m.reminder_message_id or m.forum_thread_id)
+
+            voice_event_at = self._event_target_start(m)
+            event_status = self._event_status_by_match.get(m.id)
+            voice_event_ok = event_status is not None and event_status != discord.EventStatus.scheduled
+
+            tracking_at = None
+            tracking_ok = None
+            if m.game == "cs":
+                tracking_at = m.start_time - timedelta(minutes=5)
+                tracking_ok = m.id in self.active_cs_games or (
+                    m.end_time is not None and now >= m.end_time
+                )
+
+            live_score = None
+            if m.game == "cs" and m.id in self.active_cs_games:
+                tracker = self.active_cs_games[m.id]
+                live_score = {
+                    "map": tracker.current_map,
+                    "score": f"{tracker.team_a_score}-{tracker.team_b_score}",
+                    "maps": f"{tracker.team_a_maps}-{tracker.team_b_maps}",
+                }
+
+            result.append({
+                "match_id": m.id,
+                "teams": f"{m.team_a} vs. {m.team_b}",
+                "tournament": m.tournament_name,
+                "game": m.game,
+                "start_time": m.start_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "detail_url": m.detail_url,
+                "is_live": is_live,
+                "has_discord_event": bool(m.discord_event_id),
+                "reminder_at": reminder_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "reminder_ok": reminder_ok,
+                "tracking_at": tracking_at.strftime("%Y-%m-%dT%H:%M:%SZ") if tracking_at else None,
+                "tracking_ok": tracking_ok,
+                "voice_event_at": voice_event_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "voice_event_ok": voice_event_ok,
+                "live_score": live_score,
+                "issues": issues,
+            })
+        return result
+
     async def _create_discord_event(self, match: EsportsMatch):
         """Create a Discord scheduled event for a match"""
         try:
@@ -1401,14 +1451,16 @@ class EsportsCog(commands.Cog):
                 self.log.error("No guild found with manage events permission")
                 return
             
-            # Calculate end time (default to 2 hours after start if not provided)
-            end_time = match.end_time or (match.start_time + timedelta(hours=2))
-            
+            # Event should go live 5 minutes before the real kickoff; the end
+            # time stays relative to the real kickoff (see _event_end_time).
+            event_start_time = self._event_target_start(match)
+            end_time = self._event_end_time(match)
+
             # Determine voice channel and entity type
             voice_channel = None
             entity_type = discord.EntityType.external
             location = "wannspieltbig.de"
-            
+
             # Check for voice channel assignment
             if match.block_voice_channel == "VC 1" and config.esports_vc1_id:
                 voice_channel = guild.get_channel(config.esports_vc1_id)
@@ -1420,13 +1472,13 @@ class EsportsCog(commands.Cog):
                 if voice_channel and isinstance(voice_channel, discord.VoiceChannel):
                     entity_type = discord.EntityType.voice
                     location = None
-            
+
             # Create the event
             if entity_type == discord.EntityType.voice and voice_channel:
                 event = await guild.create_scheduled_event(
                     name=match.event_name,
                     description=match.event_description,
-                    start_time=match.start_time,
+                    start_time=event_start_time,
                     end_time=end_time,
                     entity_type=entity_type,
                     channel=voice_channel,
@@ -1436,7 +1488,7 @@ class EsportsCog(commands.Cog):
                 event = await guild.create_scheduled_event(
                     name=match.event_name,
                     description=match.event_description,
-                    start_time=match.start_time,
+                    start_time=event_start_time,
                     end_time=end_time,
                     entity_type=discord.EntityType.external,
                     location="wannspieltbig.de",
@@ -1500,14 +1552,16 @@ class EsportsCog(commands.Cog):
                 await self._create_discord_event(match)
                 return
             
-            # Calculate end time
-            end_time = match.end_time or (match.start_time + timedelta(hours=2))
-            
+            # Event should go live 5 minutes before the real kickoff; the end
+            # time stays relative to the real kickoff (see _event_end_time).
+            event_start_time = self._event_target_start(match)
+            end_time = self._event_end_time(match)
+
             # Determine voice channel and entity type
             voice_channel = None
             entity_type = discord.EntityType.external
             location = "wannspieltbig.de"
-            
+
             # Check for voice channel assignment
             if match.block_voice_channel == "VC 1" and config.esports_vc1_id:
                 voice_channel = guild.get_channel(config.esports_vc1_id)
@@ -1519,7 +1573,7 @@ class EsportsCog(commands.Cog):
                 if voice_channel and isinstance(voice_channel, discord.VoiceChannel):
                     entity_type = discord.EntityType.voice
                     location = None
-            
+
             # Only update start_time if event is still scheduled (not active/completed)
             # Discord API error 50035 occurs when trying to update start_time of non-scheduled event
             now = datetime.now(timezone.utc)
@@ -1541,7 +1595,7 @@ class EsportsCog(commands.Cog):
                 if match.discord_event_id in self.event_to_match:
                     del self.event_to_match[match.discord_event_id]
                 match.discord_event_id = None
-                self._save_data()
+                await self._save_data()
                 await self._create_discord_event(match)
                 return
 
@@ -1551,7 +1605,7 @@ class EsportsCog(commands.Cog):
                     await event.edit(
                         name=match.event_name,
                         description=match.event_description,
-                        start_time=match.start_time,
+                        start_time=event_start_time,
                         end_time=end_time,
                         entity_type=entity_type,
                         channel=voice_channel
@@ -1568,7 +1622,7 @@ class EsportsCog(commands.Cog):
                     await event.edit(
                         name=match.event_name,
                         description=match.event_description,
-                        start_time=match.start_time,
+                        start_time=event_start_time,
                         end_time=end_time,
                         entity_type=discord.EntityType.external,
                         location="wannspieltbig.de"
@@ -1588,6 +1642,7 @@ class EsportsCog(commands.Cog):
     
     async def _handle_match_cancelled(self, match: EsportsMatch):
         """Handle a cancelled match by deleting its Discord event"""
+        self._record_match_event(match, "cancelled")
         try:
             if not match.discord_event_id:
                 self.log.debug(f"No Discord event to cancel for match {match.id}")
@@ -1635,6 +1690,7 @@ class EsportsCog(commands.Cog):
     
     async def _handle_match_finished(self, match: EsportsMatch):
         """Handle a finished match by ending its Discord event"""
+        self._record_match_event(match, "finished")
         try:
             if not match.discord_event_id:
                 self.log.debug(f"No Discord event to end for finished match {match.id}")
@@ -1739,84 +1795,13 @@ class EsportsCog(commands.Cog):
             # Sort by start time
             upcoming_matches.sort(key=lambda m: m.start_time)
             
-            # Create embed with thumbnail
-            week_start_str = week_start.strftime("%B %d")
-            week_end_str = (week_end - timedelta(days=1)).strftime("%B %d")
-            embed = discord.Embed(
-                title=f"This Week ({week_start_str} - {week_end_str}) • {len(upcoming_matches)} matches",
-                color=0x00ff88
-            )
-            embed.set_thumbnail(url="attachment://big.png")
-            
-            powered_by = "-# Powered by [wannspieltbig.de](https://wannspieltbig.de)"
-
-            if not upcoming_matches:
-                embed.add_field(
-                    name="No Matches Scheduled",
-                    value="No matches are scheduled for the upcoming week.",
-                    inline=False
-                )
-                embed.add_field(name="​", value=powered_by, inline=False)
-            else:
-                # Group matches by day
-                matches_by_day = {}
-                for match in upcoming_matches:
-                    # Convert to German timezone for display
-                    match_time_berlin = match.start_time.astimezone(self.germany_tz)
-                    day_key = match_time_berlin.strftime("%A, %B %d")
-
-                    if day_key not in matches_by_day:
-                        matches_by_day[day_key] = []
-                    matches_by_day[day_key].append((match, match_time_berlin))
-
-                # Add fields for each day; append powered_by to the last day's field
-                days_list = list(matches_by_day.items())
-                for i, (day, day_matches) in enumerate(days_list):
-                    match_lines = []
-                    for match, match_time in day_matches:
-                        time_str = match_time.strftime("%H:%M")
-                        # Use custom emotes for specific games
-                        if match.game == "cs":
-                            game_emoji = "<:cs:1416235161594499092>"
-                        elif match.game == "lol":
-                            game_emoji = "<:lol:1416235138307854416>"
-                        elif match.game == "tm":
-                            game_emoji = "🏎️"
-                        else:
-                            game_emoji = "🎮"
-
-                        # Create clickable link to Discord event if event exists
-                        if match.discord_event_id:
-                            # Get guild to construct event URL
-                            guild = None
-                            if config.esports_guild_id:
-                                guild = self.bot.get_guild(config.esports_guild_id)
-                            else:
-                                for g in self.bot.guilds:
-                                    if g.me.guild_permissions.manage_events:
-                                        guild = g
-                                        break
-
-                            if guild:
-                                event_url = f"https://discord.com/events/{guild.id}/{match.discord_event_id}"
-                                match_line = f"{game_emoji} **[{time_str} - {match.team_a} vs {match.team_b}]({event_url})**"
-                            else:
-                                match_line = f"{game_emoji} **{time_str} - {match.team_a} vs {match.team_b}**"
-                        else:
-                            match_line = f"{game_emoji} **{time_str} - {match.team_a} vs {match.team_b}**"
-
-                        match_lines.append(match_line)
-
-                    value = "\n".join(match_lines)
-                    if i == len(days_list) - 1:
-                        value += f"\n\n{powered_by}"
-                    embed.add_field(name=f"{day}", value=value, inline=False)
-
-            # Send the new summary with big.png thumbnail
-            file = discord.File("big.png", filename="big.png")
-            message = await channel.send(file=file, embed=embed)
+            # New posts always use the CV2 layout (see build_weekly_view)
+            guild = channel.guild or (self.bot.get_guild(config.esports_guild_id) if config.esports_guild_id else None)
+            view = build_weekly_view(upcoming_matches, week_start, week_end, guild, self.germany_tz)
+            file = discord.File("big_square.png", filename="big_square.png")
+            message = await channel.send(file=file, view=view)
             self.summary_message_id = message.id
-            self._save_data()  # Save the new message ID
+            await self._save_data()  # Save the new message ID
             
             self.log.info(f"Sent weekly summary to channel {channel.id}, message ID: {message.id}")
             status_reporter.record(
@@ -1906,8 +1891,24 @@ class EsportsCog(commands.Cog):
             
             # Sort by start time
             upcoming_matches.sort(key=lambda m: m.start_time)
-            
-            # Create updated embed (same logic as _send_weekly_summary)
+
+            # Lazy format switch: messages posted after the CV2 change are
+            # edited as CV2; a pre-existing embed message keeps the legacy
+            # rendering until the next regular re-post (new week) replaces it.
+            message = await channel.fetch_message(self.summary_message_id)
+            if message.flags.components_v2:
+                view = build_weekly_view(upcoming_matches, week_start, week_end, channel.guild, self.germany_tz)
+                await message.edit(view=view, attachments=[discord.File("big_square.png", filename="big_square.png")])
+                self.log.info(f"Updated weekly summary message {self.summary_message_id}")
+                status_reporter.record(
+                    "esports",
+                    weekly_summary_last_updated=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    weekly_summary_message_id=self.summary_message_id,
+                    weekly_summary_last_error=None,
+                )
+                return
+
+            # Create updated embed (legacy rendering, drops out with the next new week)
             week_start_str = week_start.strftime("%B %d")
             week_end_str = (week_end - timedelta(days=1)).strftime("%B %d")
             embed = discord.Embed(
@@ -2068,7 +2069,7 @@ class EsportsCog(commands.Cog):
             self.log.error(f"Error updating scores for match {tracker.match.id}: {e}")
         finally:
             # Always persist tracker state so restarts don't lose the current score
-            self._save_data()
+            await self._save_data()
 
     async def _update_event_name_with_score(self, tracker: CSGameTracker):
         """Update Discord event name with live score, e.g. 'BIG vs MIBR - 3:4 (1:0)'"""
@@ -2092,7 +2093,7 @@ class EsportsCog(commands.Cog):
             self.log.info(f"Discord event for match {match.id} is finished, stopping tracker")
             tracker.is_finished = True
             self.active_cs_games.pop(match.id, None)
-            self._save_data()
+            await self._save_data()
         except Exception as e:
             self.log.warning(f"Failed to update event name with score for match {match.id}: {e}")
 
@@ -2109,9 +2110,10 @@ class EsportsCog(commands.Cog):
                 match.id not in self.active_cs_games and
                 match.id not in self.monitored_matches):
                 
-                # Check if match is starting within the next 20 minutes
+                # Fire as close to exactly T-5 minutes as the 1-minute poll allows
+                # (same pattern as the 30-minute reminder window above).
                 time_to_start = (match.start_time - now).total_seconds()
-                if 0 <= time_to_start <= 1200:  # 20 minutes
+                if 240 <= time_to_start <= 300:  # 4-5 minutes
                     self.monitored_matches.add(match.id)
                     await self._start_cs_game_tracking(match)
     
@@ -2175,6 +2177,8 @@ class EsportsCog(commands.Cog):
 
             # Event was found — reset NotFound counter
             self.event_not_found_count.pop(event_id, None)
+            # Remember status as observed this poll, for the next_matches health check
+            self._event_status_by_match[match_id] = event.status
 
             # Check if event is completed/ended but match is still upcoming — stale completed event
             if (event.status == discord.EventStatus.completed and
@@ -2189,9 +2193,9 @@ class EsportsCog(commands.Cog):
                 await self._create_discord_event(match)
                 continue
 
-            # Check if event should be started
+            # Check if event should be started (5 minutes before real kickoff)
             if (event.status == discord.EventStatus.scheduled and
-                    match.start_time <= now):
+                    self._event_target_start(match) <= now):
                 try:
                     await event.start()
                     self.log.info(f"Started Discord event {event_id} for match {match_id}: {match.event_name}")
@@ -2213,7 +2217,7 @@ class EsportsCog(commands.Cog):
                         if event_id in self.event_to_match:
                             del self.event_to_match[event_id]
                         match.discord_event_id = None
-                        self._save_data()
+                        await self._save_data()
                         # Recreate the event so the match still has a Discord presence
                         await self._create_discord_event(match)
             
@@ -2254,12 +2258,8 @@ class EsportsCog(commands.Cog):
                 self.log.error(f"Update channel {config.esports_update_channel_id} not found")
                 return
             
-            # Create initial embed and view
-            embed = tracker.get_embed()
-            view = ScoreUpdateView(tracker, self)
-            
-            # Send message
-            message = await channel.send(embed=embed, view=view)
+            # Send the CV2 score message (layout view carries the whole content)
+            message = await channel.send(view=ScoreUpdateView(tracker, self))
             tracker.message_id = message.id
             
             # Store tracker
@@ -2289,24 +2289,18 @@ class EsportsCog(commands.Cog):
                 not match.forum_thread_id and      # No thread created yet
                 match.start_time > now):  # Match hasn't started yet
 
-                # Check if match is starting within 30-35 minutes (5-minute window for polling)
+                # Fire as close to exactly T-30 minutes as the 1-minute poll allows:
+                # a 1-minute window just below the 30-minute mark, so the reminder
+                # never goes out late and at most ~1 minute early.
                 time_to_start = (match.start_time - now).total_seconds()
-                if 1800 <= time_to_start <= 2100:  # 30-35 minutes
+                if 1740 <= time_to_start <= 1800:  # 29-30 minutes
                     await self._send_match_reminder(match, channel)
     
     async def _edit_reminder_message(self, match: EsportsMatch):
         """Edit an existing reminder message after a reschedule"""
         try:
-            embed = match.get_reminder_embed()
-
-            if match.discord_event_id:
-                for guild in self.bot.guilds:
-                    event_url = f"https://discord.com/events/{guild.id}/{match.discord_event_id}"
-                    for i, field in enumerate(embed.fields):
-                        if field.name == "📅 Discord Event":
-                            embed.set_field_at(i, name="📅 Discord Event", value=f"[Join Event]({event_url})", inline=False)
-                            break
-                    break
+            guild_id = config.esports_guild_id or (self.bot.guilds[0].id if self.bot.guilds else None)
+            view = build_reminder_view(match, guild_id)
 
             message = None
 
@@ -2334,7 +2328,7 @@ class EsportsCog(commands.Cog):
                         pass
 
             if message:
-                await message.edit(embed=embed)
+                await message.edit(view=view, attachments=[discord.File("big.png", filename="big.png")])
                 self.log.info(f"Edited reminder for rescheduled match {match.id}: {match.event_name}")
             else:
                 # Message no longer exists — clear tracking so a fresh reminder fires at 30-min mark
@@ -2361,24 +2355,10 @@ class EsportsCog(commands.Cog):
             mention_text = ""
             if ping_role_id:
                 mention_text = f"<@&{ping_role_id}>"
-            
-            # Generate embed
-            embed = match.get_reminder_embed()
-            
-            # Add Discord event link if available
-            if match.discord_event_id:
-                guild = channel.guild
-                if guild:
-                    event_url = f"https://discord.com/events/{guild.id}/{match.discord_event_id}"
-                    for i, field in enumerate(embed.fields):
-                        if field.name == "📅 Discord Event":
-                            embed.set_field_at(
-                                i,
-                                name="📅 Discord Event",
-                                value=f"[Join Event]({event_url})",
-                                inline=False
-                            )
-                            break
+
+            guild_id = channel.guild.id if channel.guild else config.esports_guild_id
+            view = build_reminder_view(match, guild_id)
+            reminder_file = discord.File("big.png", filename="big.png")
 
             # Create/reuse forum thread if configured — ping goes into the thread
             if config.esports_forum_channel_id:
@@ -2396,10 +2376,12 @@ class EsportsCog(commands.Cog):
                             if existing and isinstance(existing, discord.Thread):
                                 if existing.archived:
                                     await existing.edit(archived=False)
-                                msg = await existing.send(content=mention_text or None, embed=embed)
+                                msg = await existing.send(view=view, file=reminder_file)
+                                if mention_text:
+                                    await existing.send(content=mention_text)
                                 match.reminder_message_id = msg.id
                                 self.reminder_to_match[msg.id] = match.id
-                                self._save_data()
+                                await self._save_data()
                                 self.log.info(f"Sent rescheduled reminder in existing thread for match {match.id}: {match.event_name}")
                                 return
                             else:
@@ -2411,7 +2393,8 @@ class EsportsCog(commands.Cog):
                         game_name = {"cs": "Counter-Strike", "tm": "Trackmania", "lol": "League of Legends"}.get(match.game, match.game.upper())
                         thread_with_msg = await forum_channel.create_thread(
                             name=f"{match.team_a} vs {match.team_b} – {game_name}",
-                            embed=embed,
+                            view=view,
+                            file=reminder_file,
                         )
                         forum_thread = thread_with_msg.thread
                         match.forum_thread_id = forum_thread.id
@@ -2421,7 +2404,7 @@ class EsportsCog(commands.Cog):
                         # Send ping as separate message so Discord triggers proper notifications
                         if mention_text:
                             await forum_thread.send(content=mention_text)
-                        self._save_data()
+                        await self._save_data()
                         self.log.info(f"Sent 30-minute reminder (thread) for match {match.id}: {match.event_name}")
                         status_reporter.record(
                             "esports",
@@ -2432,11 +2415,14 @@ class EsportsCog(commands.Cog):
                     except Exception as e:
                         self.log.error(f"Error creating/reusing forum thread for match {match.id}: {e}")
 
-            # Fallback: post to games channel if no forum channel configured
-            message = await channel.send(content=mention_text, embed=embed)
+            # Fallback: post to games channel if no forum channel configured.
+            # CV2 messages cannot carry `content`, so the role ping moves into
+            # the container as a small text line.
+            view = build_reminder_view(match, guild_id, mention=mention_text or None)
+            message = await channel.send(view=view, file=discord.File("big.png", filename="big.png"))
             match.reminder_message_id = message.id
             self.reminder_to_match[message.id] = match.id
-            self._save_data()
+            await self._save_data()
             
             self.log.info(f"Sent 30-minute reminder for match {match.id}: {match.event_name}")
             status_reporter.record(
@@ -2510,7 +2496,7 @@ class EsportsCog(commands.Cog):
             del self.reminder_to_match[reminder_id]
 
         if reminders_to_delete:
-            self._save_data()
+            await self._save_data()
     
     def _close_forum_thread(self, thread_id: int, match_id: int):
         """Clean up forum thread tracking data (Discord handles archiving via inactivity setting)"""
@@ -2544,194 +2530,8 @@ class EsportsCog(commands.Cog):
         if match.reminder_message_id in self.reminder_to_match:
             del self.reminder_to_match[match.reminder_message_id]
         match.reminder_message_id = None
-        self._save_data()
+        await self._save_data()
     
-    @app_commands.command(name="wannspieltbig_status", description="Show match monitoring status")
-    @app_commands.default_permissions(administrator=True)
-    async def wannspieltbig_status(self, interaction: discord.Interaction):
-        """Show status of e-sports monitoring"""
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ You need administrator permissions to use this command.", ephemeral=True)
-            return
-        embed = discord.Embed(
-            title="🎮 E-Sports Monitoring Status",
-            color=0x7289da,
-            timestamp=datetime.utcnow()
-        )
-        
-        # Basic status
-        embed.add_field(
-            name="Status",
-            value="🟢 Enabled" if config.esports_enabled else "🔴 Disabled",
-            inline=True
-        )
-        
-        embed.add_field(
-            name="Poll Interval",
-            value=f"{config.esports_poll_interval_minutes} minutes",
-            inline=True
-        )
-        
-        summary_channel_info = "Not configured"
-        if config.esports_summary_channel_id:
-            if self.summary_message_id:
-                summary_channel_info = f"<#{config.esports_summary_channel_id}>\nMessage ID: {self.summary_message_id}"
-            else:
-                summary_channel_info = f"<#{config.esports_summary_channel_id}>\nNo summary posted yet"
-        
-        embed.add_field(
-            name="Summary Channel",
-            value=summary_channel_info,
-            inline=True
-        )
-        
-        # Match statistics
-        total_matches = len(self.matches)
-        active_matches = len([m for m in self.matches.values() if not m.cancelled])
-        cancelled_matches = total_matches - active_matches
-        events_created = len(self.event_to_match)
-        
-        embed.add_field(
-            name="📊 Statistics",
-            value=(
-                f"**Total Matches:** {total_matches}\n"
-                f"**Active Matches:** {active_matches}\n"
-                f"**Cancelled Matches:** {cancelled_matches}\n"
-                f"**Discord Events:** {events_created}"
-            ),
-            inline=False
-        )
-        
-        # Task status
-        monitor_status = "🟢 Running" if not self.match_monitor.is_being_cancelled() else "🔴 Stopped"
-
-        embed.add_field(
-            name="⚙️ Tasks",
-            value=f"**Match Monitor:** {monitor_status}",
-            inline=False
-        )
-        
-        embed.set_footer(text=f"API: {config.esports_api_url}")
-        
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-    
-    @app_commands.command(name="wannspieltbig_summary", description="Send weekly summary now")
-    @app_commands.default_permissions(administrator=True)
-    async def wannspieltbig_summary_now(self, interaction: discord.Interaction):
-        """Manually trigger weekly summary"""
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ You need administrator permissions to use this command.", ephemeral=True)
-            return
-            
-        if not config.esports_summary_channel_id:
-            await interaction.response.send_message(
-                "❌ No summary channel configured. Set ESPORTS_SUMMARY_CHANNEL_ID environment variable.",
-                ephemeral=True
-            )
-            return
-        
-        channel = self.bot.get_channel(config.esports_summary_channel_id)
-        if not channel:
-            await interaction.response.send_message(
-                f"❌ Summary channel {config.esports_summary_channel_id} not found.",
-                ephemeral=True
-            )
-            return
-        
-        await interaction.response.defer(ephemeral=True)
-        
-        try:
-            await self._send_weekly_summary(channel)
-            await interaction.followup.send("✅ Weekly summary sent successfully!", ephemeral=True)
-        except Exception as e:
-            self.log.error(f"Error sending manual summary: {e}")
-            await interaction.followup.send(f"❌ Error sending summary: {e}", ephemeral=True)
-    
-    @app_commands.command(name="wannspieltbig_refresh", description="Manually refresh match data")
-    @app_commands.default_permissions(administrator=True)
-    async def wannspieltbig_refresh(self, interaction: discord.Interaction):
-        """Manually trigger match data refresh"""
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ You need administrator permissions to use this command.", ephemeral=True)
-            return
-            
-        await interaction.response.defer(ephemeral=True)
-        
-        try:
-            await self.match_monitor()
-            await interaction.followup.send("✅ Match data refreshed successfully!", ephemeral=True)
-        except Exception as e:
-            self.log.error(f"Error in manual refresh: {e}")
-            await interaction.followup.send(f"❌ Error refreshing data: {e}", ephemeral=True)
-    
-    @app_commands.command(name="wannspieltbig_start", description="Start CS game tracking - choose from upcoming matches")
-    @app_commands.default_permissions(administrator=True)
-    async def wannspieltbig_start(self, interaction: discord.Interaction):
-        """Show upcoming CS matches to start tracking"""
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("❌ You need administrator permissions to use this command.", ephemeral=True)
-            return
-            
-        if not config.esports_update_channel_id:
-            await interaction.response.send_message("❌ No update channel configured.", ephemeral=True)
-            return
-        
-        # Get CS matches from the current week (Monday to Sunday, German timezone)
-        now = datetime.now(timezone.utc)
-        now_berlin = now.astimezone(self.germany_tz)
-        days_since_monday = now_berlin.weekday()
-        week_start = now_berlin.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days_since_monday)
-        week_end = week_start + timedelta(days=7)
-        week_start_utc = week_start.astimezone(timezone.utc)
-        week_end_utc = week_end.astimezone(timezone.utc)
-
-        upcoming_cs_matches = [
-            match for match in self.matches.values()
-            if (match.game == "cs" and
-                not match.cancelled and
-                match.start_time > now and
-                week_start_utc <= match.start_time < week_end_utc and
-                match.id not in self.active_cs_games)
-        ]
-        
-        # Sort by start time
-        upcoming_cs_matches.sort(key=lambda m: m.start_time)
-        
-        if not upcoming_cs_matches:
-            await interaction.response.send_message(
-                "❌ Keine CS-Matches in dieser Woche gefunden, die nicht bereits getrackt werden.",
-                ephemeral=True
-            )
-            return
-        
-        # Create embed showing available matches
-        embed = discord.Embed(
-            title="🎮 Select CS Match to Track",
-            description="Choose an upcoming Counter-Strike match to start live score tracking:",
-            color=0x7289da
-        )
-        
-        # Add field showing matches
-        match_list = []
-        for i, match in enumerate(upcoming_cs_matches[:10]):  # Show first 10
-            match_time = match.start_time.strftime("%H:%M")
-            match_list.append(f"**{match.team_a} vs {match.team_b}** - {match_time}")
-        
-        embed.add_field(
-            name="Available Matches",
-            value="\n".join(match_list),
-            inline=False
-        )
-        
-        if len(upcoming_cs_matches) > 10:
-            embed.set_footer(text=f"Showing first 10 of {len(upcoming_cs_matches)} matches")
-        
-        # Create view with match selection buttons
-        view = MatchSelectionView(upcoming_cs_matches, self)
-        
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-    
-
 
 async def setup(bot: commands.Bot):
     if config.esports_enabled:

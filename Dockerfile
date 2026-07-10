@@ -8,6 +8,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY bot.py .
 COPY cogs/ cogs/
 COPY core/ core/
-COPY big.png pb.png ./
+COPY db/ db/
+COPY scripts/ scripts/
+COPY big.png big_square.png pb.png ./
 
 CMD ["python", "bot.py"]

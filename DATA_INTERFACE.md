@@ -12,7 +12,7 @@ nötig.
 ## Funktionsweise
 
 - Implementiert in [`core/status_reporter.py`](core/status_reporter.py).
-- Jedes Modul (Cog, `core/http_client.py`, `core/cache_manager.py`, `bot.py`)
+- Jedes Modul (Cog inkl. `cogs/finance.py`, `core/http_client.py`, `core/cache_manager.py`, `bot.py`)
   meldet Ereignisse über zwei einfache Methoden auf dem globalen Singleton
   `status_reporter`:
   - `status_reporter.record(section, **fields)` — setzt/überschreibt Felder
@@ -70,8 +70,13 @@ diese Sektion. `counters`-Objekte liefern rollierende Zählungen der letzten
     "counters": {                            // nur vorhanden nach erstem Ereignis
       "reconnects": {"15m": 0, "1h": 0, "24h": 0},
       "command_errors": {"15m": 0, "1h": 0, "24h": 0},
-      "errors": {"15m": 0, "1h": 0, "24h": 0}
-    }
+      "errors": {"15m": 0, "1h": 0, "24h": 0},        // nur ungefangene Discord-Event-Fehler (on_error)
+      "log_errors": {"15m": 0, "1h": 0, "24h": 3},    // jeder ERROR+/CRITICAL-Log-Eintrag im gesamten Bot (ersetzt das alte Discord-Webhook-Logging)
+      "log_messages": {"15m": 12, "1h": 340, "24h": 8100}  // jeder INFO+-Log-Eintrag - "Aktivität", garantiert nie leer solange der Bot läuft
+    },
+    "error_log": [                           // rollierendes Log der letzten WARNING+-Einträge, für den Dashboard-Graphen-Klick-Popup
+      {"at": "2026-07-08T22:10:18Z", "level": "ERROR", "logger": "roaringbot.esports", "message": "Error in match monitoring: ..."}
+    ]
   },
 
   "birthday": {
@@ -84,7 +89,17 @@ diese Sektion. `counters`-Objekte liefern rollierende Zählungen der letzten
     "last_check_result": "no_birthdays",     // "sent" | "no_birthdays" | "error"
     "invalid_date_entries": 0,               // Anzahl Zeilen mit kaputtem Datumsformat
     "registered_entries": 42,
-    "last_birthday_names": ["Max"]           // nur gesetzt bei last_check_result == "sent"
+    "last_birthday_names": ["Max"],          // nur gesetzt bei last_check_result == "sent"
+    "send_errors": [],                       // nicht-leer wenn der channel.send() für den heutigen Post fehlschlug
+    "upcoming_birthdays": [                  // strikt zukünftig (nicht heute), max. 5, aufsteigend
+      {"name": "Anna", "date": "12.08", "date_iso": "2026-08-12", "days_until": 3}
+    ],
+    "recent_birthdays": [                    // letzte Vorkommen inkl. heute, bis zu 30 Tage zurück
+      {"name": "Max", "date": "08.07", "date_iso": "2026-07-08", "days_since": 0}
+    ],
+    "sent_log": [                            // rollierendes Log: ein Eintrag pro tatsächlich gesendetem Post
+      {"at": "2026-07-08T08:00:04Z", "name": "Max", "date_iso": "2026-07-08"}
+    ]
   },
 
   "esports": {
@@ -95,9 +110,11 @@ diese Sektion. `counters`-Objekte liefern rollierende Zählungen der letzten
     "last_poll_success": true,
     "last_poll_error": null,
     "last_livescore_poll_at": "2026-07-08T22:15:20Z",  // live_score_updater-Loop (nur bei aktiven CS-Matches)
-    "total_matches": 46,
-    "active_matches": 46,                    // nicht abgesagt
+    "total_matches": 46,                     // ALLE Matches im lokalen Cache, inkl. wochenaltem API-Datenmüll das wannspieltbig.de nie bereinigt
+    "active_matches": 46,                    // nicht abgesagt (gleiches Problem wie total_matches)
     "active_discord_events": 7,
+    "scheduled_matches": 6,                  // Matches innerhalb der aktuellen Woche + laufend - das, was das Dashboard als "geplante Matches" zeigt
+    "scheduled_discord_events": 6,           // davon mit tatsächlich existierendem Discord-Event
     "active_cs_trackers": 0,
     "weekly_summary_last_updated": "2026-07-08T22:15:21Z",
     "weekly_summary_message_id": 1523448617246134449,
@@ -114,6 +131,29 @@ diese Sektion. `counters`-Objekte liefern rollierende Zählungen der letzten
         "is_finished": false
       }
     ],
+    "next_matches": [                        // die 3 nächsten Matches (live oder anstehend), mit Health-Check
+      {
+        "match_id": 2314,
+        "teams": "BIG vs. TeamOrangeGaming",
+        "tournament": "ESL Pro League",
+        "game": "LoL",
+        "start_time": "2026-07-09T18:00:00Z",
+        "detail_url": "https://wannspieltbig.de/...",
+        "is_live": true,
+        "has_discord_event": true,
+        "reminder_at": "2026-07-09T17:30:00Z",   // Kickoff - 30min
+        "reminder_ok": false,                     // true sobald reminder_message_id/forum_thread_id gesetzt ist
+        "tracking_at": null,                      // Kickoff - 5min, nur bei game == "cs", sonst null
+        "tracking_ok": null,                      // null wenn nicht CS
+        "voice_event_at": "2026-07-09T17:55:00Z", // Kickoff - 5min (geclamped auf jetzt+30s)
+        "voice_event_ok": true,                   // true sobald der Discord-Event-Status != "scheduled" ist
+        "live_score": null,                       // bei laufendem CS-Match: {"map":1,"score":"7-5","maps":"0-0"}
+        // issues: leer wenn alles ok, sonst eine Teilmenge von:
+        // "no_discord_event" | "reminder_missing" | "event_not_started" | "tracking_missing" (nur CS)
+        // jedes erkannte Issue wird zusätzlich als log.error geloggt (taucht im Fehler-Log-Graphen auf)
+        "issues": []
+      }
+    ],
     "counters": {
       "api_errors": {"15m": 0, "1h": 0, "24h": 3},
       "reminder_errors": {"15m": 0, "1h": 0, "24h": 0}
@@ -123,6 +163,12 @@ diese Sektion. `counters`-Objekte liefern rollierende Zählungen der letzten
   "moderation": {
     "updated_at": "2026-07-08T22:15:18Z",
     "honeypot_loop_alive": true,             // Heartbeat des Auto-Ban-Loops
+    "honeypot_status": "ok",                 // "ok" | "disabled" | "error", zuletzt beobachteter Zustand
+    "honeypot_last_error": null,
+    "member_log_status": "ok",               // "ok" | "disabled" | "error", zuletzt beobachteter Webhook-Versand
+    "member_log_last_error": null,
+    "join_role_status": "ok",                // "ok" | "disabled" | "error", zuletzt beobachtete Rollenvergabe
+    "join_role_last_error": null,
     "last_clear_count": 12,                  // letztes /clear-Kommando
     "last_clear_channel_id": 123456789,
     "last_clear_by": "admin#0001",
@@ -132,8 +178,12 @@ diese Sektion. `counters`-Objekte liefern rollierende Zählungen der letzten
       "bans": {"15m": 0, "1h": 0, "24h": 0},
       "kicks": {"15m": 0, "1h": 0, "24h": 0},
       "timeouts": {"15m": 0, "1h": 0, "24h": 1},
+      "unbans": {"15m": 0, "1h": 0, "24h": 0},
       "honeypot_bans": {"15m": 0, "1h": 0, "24h": 0}
-    }
+    },
+    "events": [                              // rollierendes Log (max_len=300): join/leave/kick/ban/timeout/unban
+      {"at": "2026-07-08T22:10:03Z", "type": "ban", "user": "spammer#0001", "user_id": 123, "moderator": "admin#0001", "reason": "Spam", "guild": "Die Grünen"}
+    ]
   },
 
   "http": {
@@ -152,6 +202,31 @@ diese Sektion. `counters`-Objekte liefern rollierende Zählungen der letzten
     "memory_max_items": 50,
     "file_mb": 0.0,
     "file_max_mb": 100
+  },
+
+  "finance": {
+    "updated_at": "2026-07-09T06:00:12Z",
+    "sheets_connected": true,                // Google-Sheets-Auth (Kassenbuch) beim Start ok?
+    "last_error": null,
+    "current_balance": "3.609,05 €",         // Saldo-Spalte der jüngsten Buchung (String wie im Sheet)
+    "current_balance_date": "2026-06-30",
+    "transactions_recent": [                 // alle Buchungen der letzten RECENT_DAYS Tage (aktuell 90), älteste zuerst
+      {
+        "date": "2026-06-30",
+        "amount": "-1.00",                   // vorzeichenbehafteter Betrag als String (Decimal)
+        "category": "Bankgebühren",
+        "note": "",
+        "saldo": "3.609,05 €"
+      }
+    ],
+    "last_report_result": "sent",            // "sent" | "error", erst nach erstem Monatsreport gesetzt
+    "last_report_error": null,
+    "last_report_at": "2026-07-01T06:00:04Z",
+    "last_report_month": "2026-06",
+    "last_report_bilanz": "+42.50 €",        // Monatsbilanz des letzten gesendeten Reports (Summe der Monats-Transaktionen)
+    "report_log": [                          // rollierendes Log aller tatsächlich gesendeten Monatsreports
+      {"at": "2026-07-01T06:00:04Z", "month": "2026-06", "sent_at": "2026-07-01T06:00:04Z"}
+    ]
   }
 }
 ```
@@ -166,6 +241,8 @@ diese Sektion. `counters`-Objekte liefern rollierende Zählungen der letzten
 | Geburtstags-Feature kaputt | `birthday.sheets_connected == false` oder `birthday.last_check_result == "error"` |
 | CS-Tracking aktiv | `esports.active_cs_trackers > 0`, Details in `esports.cs_trackers[]` |
 | Reconnect-Häufung | `bot.counters.reconnects["1h"]` > 2–3 |
+| Kassenbuch-Feature kaputt | `finance.sheets_connected == false` oder `finance.last_error` gesetzt |
+| Monatsreport verpasst | `finance.last_report_month` entspricht nicht dem Vormonat, obwohl der 1. bereits vergangen ist |
 
 ## Konsum durch das Dashboard
 

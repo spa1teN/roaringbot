@@ -50,9 +50,11 @@ class BirthdayCog(commands.Cog):
 
         try:
             records = await asyncio.get_event_loop().run_in_executor(None, self._fetch_birthdays)
+            today = datetime.now(GERMAN_TZ).date()
             status_reporter.record(
                 "birthday",
-                upcoming_birthdays=self._compute_upcoming(records, datetime.now(GERMAN_TZ).date()),
+                upcoming_birthdays=self._compute_upcoming(records, today),
+                recent_birthdays=self._compute_recent(records, today),
             )
         except Exception as e:
             self.log.warning(f"Initial upcoming-birthdays fetch failed (will retry on daily check): {e}")
@@ -94,7 +96,9 @@ class BirthdayCog(commands.Cog):
             return
 
         today_str = now_berlin.strftime("%d.%m")
-        upcoming_birthdays = self._compute_upcoming(records, now_berlin.date())
+        today = now_berlin.date()
+        upcoming_birthdays = self._compute_upcoming(records, today)
+        recent_birthdays = self._compute_recent(records, today)
 
         birthday_names = []
         invalid_dates = 0
@@ -123,6 +127,18 @@ class BirthdayCog(commands.Cog):
             if row_day_month == today_str:
                 birthday_names.append(discord_name)
 
+        # Idempotency guard: don't double-post if the bot restarted right
+        # around the 10:00 check and this loop iteration fires twice for
+        # the same day.
+        guild_id = channel.guild.id if channel.guild else None
+        already_sent = [
+            name for name in birthday_names
+            if await self.bot.db.birthdays.already_sent(guild_id, name, today)
+        ]
+        if already_sent:
+            self.log.info(f"Skipping already-sent birthdays today: {', '.join(already_sent)}")
+            birthday_names = [n for n in birthday_names if n not in already_sent]
+
         if not birthday_names:
             self.log.info("No birthdays today")
             status_reporter.record(
@@ -130,9 +146,11 @@ class BirthdayCog(commands.Cog):
                 last_check_at=_now_iso(),
                 last_check_result="no_birthdays",
                 last_error=None,
+                send_errors=[],
                 invalid_date_entries=invalid_dates,
                 registered_entries=len(records),
                 upcoming_birthdays=upcoming_birthdays,
+                recent_birthdays=recent_birthdays,
             )
             return
 
@@ -148,26 +166,50 @@ class BirthdayCog(commands.Cog):
             names_formatted += f" und **{birthday_names[-1]}**"
             description = f"{names_formatted} haben heute Geburtstag!"
 
-        embed = discord.Embed(
-            title=f"Happy Birthday!{emote_str}",
-            description=description,
-            color=0xFFD700,
-        )
-        await channel.send(embed=embed)
+        view = discord.ui.LayoutView(timeout=None)
+        container = discord.ui.Container(accent_colour=discord.Colour(0xFFD700))
+        container.add_item(discord.ui.TextDisplay(f"## Happy Birthday!{emote_str}\n{description}"))
+        view.add_item(container)
+        try:
+            await channel.send(view=view)
+        except Exception as e:
+            self.log.error(f"Failed to send birthday message for {', '.join(birthday_names)}: {e}")
+            status_reporter.record(
+                "birthday",
+                last_check_at=_now_iso(),
+                last_check_result="error",
+                last_error=str(e),
+                send_errors=[{"name": n, "date_iso": today.isoformat()} for n in birthday_names],
+                invalid_date_entries=invalid_dates,
+                registered_entries=len(records),
+                upcoming_birthdays=upcoming_birthdays,
+                recent_birthdays=recent_birthdays,
+            )
+            return
+
         self.log.info(f"Sent birthday message for: {', '.join(birthday_names)}")
+        for name in birthday_names:
+            await self.bot.db.birthdays.mark_sent(guild_id, name, today)
+            status_reporter.record_event(
+                "birthday", "sent_log",
+                {"name": name, "date_iso": today.isoformat()},
+                max_len=100,
+            )
         status_reporter.record(
             "birthday",
             last_check_at=_now_iso(),
             last_check_result="sent",
             last_error=None,
+            send_errors=[],
             invalid_date_entries=invalid_dates,
             registered_entries=len(records),
             last_birthday_names=birthday_names,
             upcoming_birthdays=upcoming_birthdays,
+            recent_birthdays=recent_birthdays,
         )
 
     def _compute_upcoming(self, records: list, today, limit: int = 5) -> list:
-        """Return the next `limit` upcoming birthdays, sorted by days until next occurrence."""
+        """Return the next `limit` upcoming birthdays (strictly future, not today), sorted by days until next occurrence."""
         upcoming = []
         for record in records:
             discord_name = record.get("Discord", "").strip()
@@ -188,7 +230,7 @@ class BirthdayCog(commands.Cog):
 
             try:
                 next_date = parsed.replace(year=today.year).date()
-                if next_date < today:
+                if next_date <= today:
                     next_date = next_date.replace(year=today.year + 1)
             except ValueError:
                 continue  # e.g. 29.02 in a non-leap year
@@ -196,11 +238,53 @@ class BirthdayCog(commands.Cog):
             upcoming.append({
                 "name": discord_name,
                 "date": parsed.strftime("%d.%m"),
+                "date_iso": next_date.isoformat(),
                 "days_until": (next_date - today).days,
             })
 
         upcoming.sort(key=lambda u: u["days_until"])
         return upcoming[:limit]
+
+    def _compute_recent(self, records: list, today, days_back: int = 30) -> list:
+        """Return birthdays whose most recent occurrence (including today) falls within the
+        last `days_back` days, sorted most recent first. Used to show 'past month' birthdays
+        alongside whether the daily post actually went out (see `sent_log` events)."""
+        recent = []
+        for record in records:
+            discord_name = record.get("Discord", "").strip()
+            date_str = record.get("Geburtsdatum", "").strip()
+            left_date = record.get("Datum Austritt", "").strip()
+            if not discord_name or discord_name == "-" or not date_str or left_date:
+                continue
+            try:
+                parts = date_str.split(".")
+                if len(parts) == 3:
+                    parsed = datetime.strptime(date_str, "%d.%m.%Y")
+                elif len(parts) == 2:
+                    parsed = datetime.strptime(date_str, "%d.%m")
+                else:
+                    continue
+            except ValueError:
+                continue
+
+            try:
+                occurrence = parsed.replace(year=today.year).date()
+                if occurrence > today:
+                    occurrence = occurrence.replace(year=today.year - 1)
+            except ValueError:
+                continue  # e.g. 29.02 in a non-leap year
+
+            days_since = (today - occurrence).days
+            if 0 <= days_since <= days_back:
+                recent.append({
+                    "name": discord_name,
+                    "date": parsed.strftime("%d.%m"),
+                    "date_iso": occurrence.isoformat(),
+                    "days_since": days_since,
+                })
+
+        recent.sort(key=lambda r: r["days_since"])
+        return recent
 
     def _fetch_birthdays(self) -> list:
         """Fetch all records from the Register worksheet (synchronous, run in executor)"""

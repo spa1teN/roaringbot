@@ -55,6 +55,32 @@ class StatusReporter:
         """Record one occurrence of an event for rolling-window rate counting (15m/1h/24h)."""
         self._counters[section][counter].append(time.time())
 
+    def load(self):
+        """Restore sections (rolling event logs, last-known fields) from a previous run's
+        status.json, so a bot restart doesn't wipe the dashboard's history (e.g. match
+        events, sent birthday posts, monthly finance reports). Counters are intentionally
+        dropped — they're rebuilt from live events, and we have no reliable timestamps to
+        replay them with. Call before cogs load, so fresh cog_load() values still win."""
+        if not os.path.exists(STATUS_FILE):
+            return
+        try:
+            with open(STATUS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            log.warning("Failed to load previous status.json, starting fresh")
+            return
+
+        restored = []
+        for section, fields in data.items():
+            if section in ("generated_at", "uptime_seconds") or not isinstance(fields, dict):
+                continue
+            fields = dict(fields)
+            fields.pop("counters", None)
+            self._sections[section].update(fields)
+            restored.append(section)
+        if restored:
+            log.info(f"Restored status sections from previous run: {', '.join(restored)}")
+
     # ─── Snapshot assembly ──────────────────────────────────────────────────
     def _counter_windows(self, timestamps: Deque[float], now: float) -> Dict[str, int]:
         while timestamps and now - timestamps[0] > _COUNTER_RETENTION_SECONDS:

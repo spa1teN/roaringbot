@@ -9,6 +9,9 @@ google-auth>=2.0.0
 # HTTP Client
 aiohttp>=3.8.0
 
+# Database
+asyncpg>=0.29.0
+
 # System Monitoring
 psutil>=5.9.0
 

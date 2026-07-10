@@ -1,353 +1,256 @@
 # RoaringBot - Discord Bot
 
 ## Overview
-RoaringBot is a Discord bot written in Python that provides comprehensive e-sports match monitoring, birthday reminders, and moderation features for Discord servers. Built with enterprise-grade architecture including validation, caching, and configuration management.
+RoaringBot is a Discord bot (Python, discord.py ≥ 2.6) for the BIG Bears community:
+e-sports match monitoring for BIG via wannspieltbig.de, birthday reminders, a
+Kassenbuch (finance) report, and moderation features. State lives in Postgres,
+live status is exposed to the server dashboard via `data/status.json`
+(see [DATA_INTERFACE.md](DATA_INTERFACE.md)).
 
-## Core Features
+Runs as two Docker containers (`docker compose up -d --build`):
+`roaringbot` (the bot) and `roaringbot-db` (Postgres 16, schema auto-applied
+from `db/schema.sql` on first start).
 
-### 🎂 Birthday Reminders
-- Daily birthday check at 10:00 German time (DST-aware)
-- Reads from Google Spreadsheet worksheet "Register" via Service Account
-- Uses columns "Discord" (username) and "Geburtsdatum" (dd.mm.yyyy)
-- Skips members with "Datum Austritt" set (inactive members) or "-" as Discord name
-- Posts birthday embed with bold names and configurable Discord emote to channel
+## Cogs
 
-### 🎮 E-Sports Match Monitoring
-- Automated polling of wannspieltbig.de API for BIG team matches
-- Discord scheduled event creation with voice channel integration
-- **Automatic Discord Event Management:**
-  - Events automatically start when match begins (status: Scheduled → Active)
-  - Events automatically end when match finishes (status: Active → Completed)
-  - **Enhanced Auto-Ending Logic**: Events are automatically ended when matches disappear from API response (indicating completion), eliminating dependence on unreliable API `end_time` field
-  - Fallback auto-end after 4 hours for matches without proper end times
-  - Comprehensive logging and error handling for event status changes
-- **Continuous Weekly Summaries:**
-  - Single weekly overview message that updates automatically throughout the week
-  - Shows current week matches (Monday to Sunday) with live updates as matches are added/cancelled
-  - Automatically creates new weekly message when week changes and deletes previous week's message
-  - Updates every 5-15 minutes during match monitoring with BIG logo thumbnail
-- Match cancellation handling with automatic event deletion
-- **30-Minute Match Reminders:**
-  - Automated reminder messages posted 30 minutes before each match starts
-  - Game-specific role pings (configurable via PING_CS, PING_LOL, PING_TM environment variables)
-  - Rich embed format showing teams, tournament, start time, and Discord event links
-  - Automatic cleanup of reminder messages after matches end
-  - Reminder tracking and persistence across bot restarts
-- **Advanced Counter-Strike Live Score Tracking:**
-  - Guaranteed automatic score tracking for every CS match (starts up to 20 minutes before match begins)
-  - **Enhanced Duplicate Prevention:** Persistent tracking of monitored matches across bot restarts to prevent duplicate score messages
-  - Interactive buttons: Team round wins, Manual score input modal
-  - Proper CS overtime rules (12-12 → first to 16, 15-15 → first to 19, etc.)
-  - **Unified Map Completion Confirmation:** Both increment buttons and manual score input trigger confirmation system when winning scores are reached
-  - Real-time score synchronization with wannspieltbig.de API using actual matchmap IDs
-  - Multi-map progression through Best of 3/5 matches
-  - Visual overtime indicators (OT1, OT2, OT3, etc.)
-  - Interactive match selection interface for starting tracking
-- Custom game emotes for different esports titles
+### 🎮 E-Sports (`cogs/esports.py`)
+Polls `https://wannspieltbig.de/api/match_upcoming/` (all pages) every
+`ESPORTS_POLL_INTERVAL_MINUTES` (production: 1 minute).
 
-### 🛡️ Moderation System  
-- Member join/leave/ban/kick/timeout logging via Discord webhooks
-- Auto-role assignment on member join
-- Message clearing with bulk delete (1-100 messages)
-- Interactive dashboard with buttons
+**API time handling (load-bearing, verified against the live API):**
+- `first_map_at` carries German wall-clock digits regardless of its offset
+  suffix — the offset is discarded and the digits re-interpreted as
+  Europe/Berlin.
+- `last_map_end` carries a genuine UTC (`Z`) timestamp and is trusted as-is;
+  values earlier than start+15min are discarded (then event end falls back to
+  start + 1h × best-of).
+- Matches with missing `tournament`/`lineup_a` are skipped with an error log;
+  missing `lineup_b` renders as "TBA". `lineup_b.team_logo_url` is kept for the
+  reminder rendering.
 
-## Commands
+**Discord events:** one scheduled event per new, non-cancelled, future match
+(`known_match_ids` in Postgres prevents duplicates across restarts). Voice
+events when the API's `block_voice_channel` is "VC 1"/"VC 2" and
+`ESPORTS_VC1`/`ESPORTS_VC2` are set, otherwise external ("wannspieltbig.de").
+Event start = kickoff − 5 min (clamped to now+30s); auto-start when due
+(3 failures → delete + recreate), auto-end at `last_map_end` or 4 h after
+kickoff as fallback. Reschedules edit the event (or end + recreate if it is
+already active and moved > 1 h into the future). Cancelled → event deleted;
+match disappeared from the API → treated as finished (end/delete + cleanup).
+A missing event is only recreated after 2 consecutive NotFound polls; stale
+`event_to_match` entries are reconciled against live guild events on startup.
 
-### E-Sports Commands (Admin only)
-- `/wannspieltbig_status` - Show e-sports monitoring status and statistics
-- `/wannspieltbig_summary` - Manually send weekly match summary
-- `/wannspieltbig_refresh` - Manually refresh match data from API
-- `/wannspieltbig_start` - Start CS game tracking with interactive match selection
+**30-minute reminders:** fired in a 29–30 min window before kickoff (never
+late, at most 1 min early). With `ESPORTS_FORUM_CHANNEL_ID` set (production),
+each match gets a forum thread ("BIG vs X – Counter-Strike") with the reminder
+message; the game-specific role ping (`PING_CS`/`PING_LOL`/`PING_TM`) goes as
+a separate message into the thread. Fallback without forum channel: posted to
+the summary channel (ping inside the message). Rendering: **Components V2**
+(`build_reminder_view`) — media gallery with both team logos (`big.png`
+attachment + `team_b_logo_url` if present), heading with live countdown, link
+buttons Join Event / wannspieltbig.de / HLTV (HLTV only for CS). Reschedules
+edit the message; after match end, channel reminders are deleted and threads
+untracked (Discord archives them by inactivity).
 
-### Moderation Commands
-- `/mod_dashboard` - Access moderation configuration dashboard (Admin only)
-- `/clear <amount>` - Delete 1-100 messages from current channel (Admin only)
+**Weekly summary:** a single continuously-updated message in the summary
+channel covering Monday–Sunday (Europe/Berlin), refreshed on every poll; on
+week change the old message is deleted and a new one posted. Rendering:
+**Components V2** (`build_weekly_view`) — header section with the
+square-padded club logo (`big_square.png`), one block per day with
+event-linked match lines. A pre-CV2 embed message keeps being edited in the
+legacy embed format until the next regular re-post switches formats (the
+legacy embed branch in `_update_existing_summary` can be deleted once the
+first CV2 weekly message exists).
 
-## Environment Configuration
+**CS live-score tracking:** starts automatically 4–5 min before every CS
+match (no manual command). Posts a **Components V2** score message to
+`ESPORTS_UPDATE_CHANNEL_ID`: heading with the current round score, a
+monospace map table (per-map score, winner ✓, "● live" incl. overtime
+target), and admin-only buttons ("X won round" / "Y won round" / manual score
+modal). Map completion always requires a confirm/cancel step. Correct CS
+overtime rules (12-12 → first to 16, 15-15 → 19, …). Every change is PUT back
+to `https://wannspieltbig.de/api/matchmap_update/<matchmap_id>/` with Basic
+auth (`WSB_User`/`WSB_PW` — note the exact env-var casing). A 30 s
+`live_score_updater` loop syncs round/map scores from
+`/api/match_livescore/` (external edits show up in Discord) and detects the
+finish (map score reached, or `has_ended` with ≥ 1 map played) → winner
+rendering, event ended, tracker removed. Trackers survive restarts via
+Postgres; the map table's history is display-only in-memory state that the
+livescore sync rebuilds from the API within 30 s. After a Gateway RESUME all
+score messages are re-rendered so the buttons work again.
 
-### Required Environment Variables
+### 🛡️ Moderation (`cogs/moderation.py`)
+Per-guild config lives in Postgres, managed via `/mod_dashboard` (interactive
+buttons, admin only):
+- **Member log** via a per-guild channel webhook: classic embeds for
+  join/leave/kick/ban/timeout/unban (kick vs. leave disambiguated via audit
+  log within 10 s; ban reason via `fetch_ban`, moderators via audit log).
+  Join embeds carry a "Profil" **link button** (allowed on plain webhooks —
+  only interactive components would need an application webhook). Sent with
+  `pb.png` as avatar, fallback without.
+- **Auto join role** per guild; assignment result is shown in the join embed.
+- **Honeypot**: every 60 s, members holding the configured honeypot role in
+  the **hardcoded** guild `624700952636817448` are banned ("Autobann").
+- `/clear <1-100>`: bulk delete (fails for messages > 14 days, admin only).
+
+Caveat: leave-duration is in-memory — only joins observed during the current
+process lifetime produce a "time on server" value.
+
+### 🎂 Birthday (`cogs/birthday.py`)
+Task runs at 08:00 **and** 09:00 UTC, but only acts when it is 10:00 in
+Berlin (DST gate) → exactly one attempt per day. Reads the "Register"
+worksheet (columns located by header: "Discord", "Geburtsdatum",
+"Datum Austritt"); skips empty/"-" names, missing dates and members with an
+exit date; accepts `dd.mm.yyyy` and `dd.mm`. Posts one gold **Components V2**
+container ("Happy Birthday! …" with the `tabsSax` emote — emote *name* is
+hardcoded, only the ID comes from env). Per-day dedup via Postgres, so a
+restart around 10:00 cannot double-post. Also feeds
+`upcoming_birthdays`/`recent_birthdays` to the dashboard. Known limitation:
+Feb 29 birthdays are not celebrated in non-leap years.
+
+### 💰 Finance / Kassenbuch (`cogs/finance.py`)
+Functional port of the old BearsFinanz cron script. Own service account
+(`config/kassenbuch_credentials.json`), own spreadsheet/worksheet. Daily
+check at 06:00 UTC, posts **only on the 1st of the month**: an embed report
+for the previous month (every transaction as a line, opening/closing balance,
+monthly balance) with a link button to the sheet. Every 6 h it refreshes the
+dashboard status (current balance + transactions of the last 90 days).
+No slash commands. Amount parsing expects German currency format with a cents
+part ("1.234,56 €").
+
+## Message rendering (Components V2 vs. embeds)
+CV2 (`discord.ui.LayoutView`, requires discord.py ≥ 2.6; CV2 messages cannot
+carry `content`/`embeds`, and cannot be edited back to embeds):
+- CS score tracker, match reminder, weekly summary, birthday post.
+
+Classic embeds (kept intentionally):
+- member log (webhook), `/mod_dashboard` + setup confirmations, `/clear`
+  confirmation, Kassenbuch monthly report.
+
+Assets: `big.png` (original club logo, reminder gallery), `big_square.png`
+(square-padded variant so thumbnails don't crop the paw), `pb.png` (webhook
+avatar).
+
+## Slash commands
+- `/mod_dashboard` — moderation configuration (admin)
+- `/clear <amount>` — delete 1–100 messages (admin)
+
+(The former `/wannspieltbig_*` commands were removed 2026-07-10; CS tracking
+is automatic-only now.)
+
+## Persistence (Postgres, `db/`)
+`asyncpg` pool + repositories (`db/repositories/`), schema in
+`db/schema.sql` (auto-applied by the postgres container on first start):
+- moderation per-guild config
+- e-sports state: event/reminder/thread↔match maps, known/monitored match
+  ids, weekly summary message id, active CS trackers
+- birthday sent-dedup
+
+`scripts/migrate_data.py` was the one-time migration from the old JSON files.
+
+## Logging & status
+- **No Discord webhook logging.** `ErrorTrackerHandler` in `bot.py` feeds the
+  dashboard instead: every INFO+ record counts into
+  `bot.counters.log_messages`, ERROR+ into `log_errors`, WARNING+ into the
+  rolling `bot.error_log`.
+- `core/status_reporter.py` writes a full snapshot to `data/status.json`
+  every 15 s (atomic replace); rolling event logs are restored from the
+  previous snapshot on startup. This file is the **only** interface external
+  tools (the dashboard) should consume — see [DATA_INTERFACE.md](DATA_INTERFACE.md).
+- File logs in `logs/` with daily rotation, 30 days retention; each cog gets
+  its own file (`esports.log`, `birthday.log`, …) plus the main
+  `roaringbot.log`.
+
+## Environment configuration (`.env`, read by `core/config.py`)
 ```bash
-DISCORD_TOKEN=your_bot_token_here           # Discord bot token (required)
+DISCORD_TOKEN=...                    # required
+
+# E-Sports
+ESPORTS_ENABLED=true                 # default true
+ESPORTS_API_URL=...                  # default match_upcoming endpoint
+ESPORTS_POLL_INTERVAL_MINUTES=1      # default 5
+ESPORTS_GUILD_ID=...                 # guild for events (else first with perms)
+ESPORTS_SUMMARY_CHANNEL_ID=...       # weekly summary (+ reminder fallback)
+ESPORTS_UPDATE_CHANNEL_ID=...        # CS score tracker messages
+ESPORTS_FORUM_CHANNEL_ID=...         # reminder forum threads
+ESPORTS_VC1=... / ESPORTS_VC2=...    # voice channels for "VC 1"/"VC 2" events
+WSB_User=... / WSB_PW=...            # wannspieltbig Basic auth (exact casing!)
+PING_CS=... / PING_LOL=... / PING_TM=...  # reminder ping role ids
+
+# Birthday
+BIRTHDAY_CHANNEL_ID=...              # cog disabled if unset
+BIRTHDAY_SPREADSHEET_ID=...          # cog disabled if unset
+GOOGLE_SERVICE_ACCOUNT_FILE=config/google_credentials.json
+BIRTHDAY_EMOTE_ID=...
+
+# Kassenbuch / Finance
+KASSENBUCH_CHANNEL_ID=...            # cog disabled if unset
+KASSENBUCH_SPREADSHEET_ID=...        # cog disabled if unset
+KASSENBUCH_WORKSHEET_NAME=Kassenbuch
+KASSENBUCH_SERVICE_ACCOUNT_FILE=config/kassenbuch_credentials.json
+
+# Database (compose wires DB_HOST/DB_PORT into the bot container)
+DB_USER=roaringbot
+DB_PASSWORD=...
+DB_NAME=roaringbot
+
+# Optional
+BOT_OWNER_ID=..., GUILD_ID=..., LOG_LEVEL=INFO,
+MAX_CACHE_SIZE_MB=100, MAX_MEMORY_CACHE_ITEMS=50,
+HTTP_TIMEOUT=30, MAX_HTTP_CONNECTIONS=100, MAX_HTTP_CONNECTIONS_PER_HOST=10
 ```
 
-### Optional Environment Variables
-```bash
-# Bot Configuration
-BOT_OWNER_ID=485051896655249419             # Bot owner Discord ID
-LOG_WEBHOOK_URL=https://discord.com/api/... # Discord webhook for logging
-
-# Birthday Configuration
-BIRTHDAY_CHANNEL_ID=123456789              # Channel for birthday messages
-BIRTHDAY_SPREADSHEET_ID=abc123             # Google Spreadsheet ID
-GOOGLE_SERVICE_ACCOUNT_FILE=config/google_credentials.json  # Path to service account JSON
-BIRTHDAY_EMOTE_ID=123456789               # Discord emote ID for birthday messages
-
-# E-Sports Configuration
-ESPORTS_ENABLED=true                        # Enable e-sports monitoring
-ESPORTS_API_URL=https://wannspieltbig.de/api/match_upcoming/  # API endpoint
-ESPORTS_POLL_INTERVAL_MINUTES=5             # How often to check for match updates
-ESPORTS_SUMMARY_CHANNEL_ID=123456789        # Channel for weekly summaries
-ESPORTS_UPDATE_CHANNEL=123456789            # Channel for live CS score updates
-ESPORTS_GUILD_ID=1383680285186723881        # Specific guild ID for Discord events (hardcoded)
-ESPORTS_VC1=123456789                       # Voice channel 1 ID for events
-ESPORTS_VC2=123456789                       # Voice channel 2 ID for events
-WSB_USER=username                           # Wannspieltbig.de API username
-WSB_PW=password                            # Wannspieltbig.de API password
-
-# Match Reminder Configuration
-PING_CS=123456789                          # Role ID for Counter-Strike match pings
-PING_LOL=123456789                         # Role ID for League of Legends match pings
-PING_TM=123456789                          # Role ID for Trackmania match pings
-
-# Cache Configuration
-MAX_CACHE_SIZE_MB=100                       # Max disk cache size
-MAX_MEMORY_CACHE_ITEMS=50                   # Max memory cache items
-
-# HTTP Configuration
-HTTP_TIMEOUT=30                             # HTTP request timeout
-MAX_HTTP_CONNECTIONS=100                    # Max HTTP connection pool size
-MAX_HTTP_CONNECTIONS_PER_HOST=10            # Max connections per host
-```
-
-## Project Structure
-
+## Project structure
 ```
 RoaringBot/
-├── bot.py                    # Main bot file with enhanced logging
-├── CLAUDE.md                 # This documentation file
+├── bot.py                    # Bot class, logging, status wiring, cog loading
+├── CLAUDE.md / DATA_INTERFACE.md
+├── docker-compose.yml        # bot + roaringbot-db (Postgres 16)
+├── Dockerfile
+├── big.png / big_square.png / pb.png
 ├── cogs/
-│   ├── birthday.py          # Birthday reminder from Google Spreadsheet
-│   ├── esports.py           # E-sports match monitoring and CS score tracking
-│   └── moderation.py        # Moderation features
-├── core/                    # Core system modules
-│   ├── config.py            # Centralized configuration management
-│   ├── validation.py        # System validation and health checks
-│   ├── cache_manager.py     # Advanced caching system (LRU + file)
-│   ├── http_client.py       # HTTP client with connection pooling
-│   ├── colors.py            # Color constants and utilities
-│   ├── timezone_util.py     # Timezone handling utilities
-│   └── mod_views.py        # Moderation UI components
-├── data/
-│   └── cache/              # Managed file cache directory
-├── logs/                   # Application logs with rotation
-├── config/                 # Runtime configuration storage
-│   ├── esports_data.json   # E-sports match and event tracking data
-│   └── google_credentials.json  # Google Service Account key (not in git)
-└── test/                   # API testing and screenshots
+│   ├── birthday.py           # daily birthday post (CV2)
+│   ├── esports.py            # match monitoring, events, reminders, weekly
+│   │                         #   summary, CS tracking (CV2 builders live here)
+│   ├── finance.py            # Kassenbuch monthly report + status
+│   └── moderation.py         # member log, join role, honeypot, /clear
+├── core/
+│   ├── config.py             # env-based config accessors
+│   ├── status_reporter.py    # data/status.json writer (dashboard interface)
+│   ├── cache_manager.py, http_client.py, validation.py,
+│   ├── colors.py, timezone_util.py, mod_views.py
+├── db/
+│   ├── connection.py         # asyncpg pool singleton
+│   ├── schema.sql
+│   └── repositories/         # moderation, esports, birthday, guild
+├── scripts/migrate_data.py   # one-time JSON→Postgres migration
+├── config/                   # credentials (gitignored)
+├── data/                     # status.json + cache (gitignored)
+└── logs/                     # rotated logs (gitignored)
 ```
 
-## Technical Architecture
+## Development notes
+- Deploy: `docker compose up -d --build` (slash commands re-sync on startup,
+  so removed commands disappear automatically).
+- The dashboard (`/root/dashboard`) consumes `data/status.json` read-only;
+  when adding status fields, document them in DATA_INTERFACE.md.
+- HTTP client (`core/http_client.py`): pooling, DNS cache, retry with
+  backoff; API errors are counted per section in the status snapshot.
+- PyNaCl warning at startup is expected (no voice support needed).
 
-### Core Systems
-
-#### Configuration Management (`core/config.py`)
-- Environment variable-based configuration
-- Type-safe property accessors
-- Validation and logging of configuration state
-- Default values for optional settings
-
-#### Validation System (`core/validation.py`)
-- Comprehensive startup validation
-- Discord token format validation
-- System requirements checking (Python version, packages)
-- Network connectivity testing
-
-#### Caching System (`core/cache_manager.py`)
-- **LRU Memory Cache**: Fast access with automatic eviction
-- **Managed File Cache**: Disk-based with size limits and cleanup
-- **Automatic Cleanup**: Periodic tasks and size-based management
-- **Access Time Tracking**: LRU eviction based on usage patterns
-
-#### HTTP Client Management (`core/http_client.py`)
-- **Connection Pooling**: Optimized connection reuse
-- **DNS Caching**: 5-minute TTL for improved performance
-- **Keep-Alive**: 30-second connection persistence
-- **Rate Limiting**: Built-in request throttling
-- **Custom User-Agent**: Proper identification for external services
-- **Retry Logic**: Automatic retry for timeouts and connection errors with exponential backoff
-- **Error Resilience**: Handles network issues gracefully with configurable retry attempts
-
-### Enhanced Bot Features
-
-#### Advanced Logging
-- **Webhook Integration**: Real-time Discord logging
-- **Timed Log Rotation**: Daily log file rotation with cleanup
-- **Structured Logging**: Consistent format across all modules
-- **Error Tracking**: Exception details with stack traces
-- **Performance Metrics**: Cache statistics and system health
-
-#### Startup Validation
-- System requirements verification
-- Configuration validation
-- Network connectivity testing
-- Dependency verification
-
-
-### E-Sports System Architecture
-
-#### Match Monitoring (`cogs/esports.py`)
-- **API Polling**: Regular checks of wannspieltbig.de API (default: 5 minutes, configurable)
-- **Event Lifecycle Management**: Automatic creation, updating, and deletion of Discord events
-- **Automatic Event Status Control**: 
-  - Events automatically transition from "Scheduled" to "Active" when match start time arrives
-  - Events automatically transition from "Active" to "Completed" when match end time arrives
-  - Fallback mechanism auto-ends events after 4 hours for safety
-  - Real-time status checking every 5 minutes (configurable via poll interval)
-- **Persistent Storage**: JSON-based storage for match data, Discord event mappings, and monitored match tracking
-- **Timezone Handling**: German timezone conversion for scheduling and display
-- **Multi-Match Tracking**: Concurrent monitoring of multiple matches
-
-#### CS Score Tracking System
-- **Automatic Triggering**: Monitors CS matches and starts tracking 5 minutes before match begins
-- **CSGameTracker Class**: Manages round-by-round scoring with proper overtime state tracking
-- **Interactive UI Components**:
-  - MatchSelectionView: Interactive button interface for selecting matches to track
-  - ScoreUpdateView: Team round win buttons + Manual score input button
-  - ManualScoreModal: Clean modal interface for direct score input with validation
-  - MapConfirmationView: Confirm/cancel map completion when winning score is reached
-- **Correct CS Scoring Rules**:
-  - Regular time: First to 13 rounds wins
-  - Overtime only triggered by exact ties: 12-12 → first to 16, 15-15 → first to 19, 18-18 → first to 22, etc.
-  - Proper overtime state persistence through score changes
-- **Enhanced Features**:
-  - Interactive match selection with team names and start times displayed
-  - Manual score input via modal with real-time validation (0-30 rounds)
-  - Map completion confirmation system (prevents accidental map endings)
-  - Visual overtime indicators (Map X (OT1), Map X (OT2), etc.)
-  - Seamless message updates (no ephemeral responses)
-  - User-friendly interface without requiring match or map IDs
-- **API Integration**: Real-time synchronization with wannspieltbig.de using actual matchmap IDs extracted from match data
-- **Multi-Map Support**: Automatic progression through Best of 3/5 matches with confirmation flow
-- **Admin Permissions**: All score updates and confirmations restricted to administrators only
-- **Network Resilience**: Automatic retry logic handles API timeouts and connection errors gracefully
-
-#### Weekly Summary System
-- **Continuous Updates**: Single weekly message that updates automatically throughout the week
-- **Current Week Focus**: Shows matches for current week (Monday to Sunday) in German timezone  
-- **Smart Week Management**: Automatically creates new weekly message and deletes previous week's message
-- **Live Synchronization**: Updates every 5-15 minutes when match data changes (new matches, cancellations)
-- **Visual Design**: BIG logo as thumbnail (big.png file attachment) with game-specific emotes
-- **Interactive Elements**: Clickable Discord event links and organized display by day
-- **Persistent Tracking**: Maintains weekly message across bot restarts and updates
-
-### Birthday System (`cogs/birthday.py`)
-- **Google Sheets Integration**: Reads from "Register" worksheet via gspread with Service Account auth
-- **Daily Check**: `@tasks.loop(time=09:00 UTC)` with German timezone gate (runs at 10:00 MEZ/MESZ)
-- **Spreadsheet Parsing**: Dynamically finds "Discord", "Geburtsdatum", "Datum Austritt" columns by header index
-- **Member Filtering**: Skips inactive members (with exit date), placeholder names ("-"), and empty fields
-- **Custom Emote**: Configurable Discord emote via `BIRTHDAY_EMOTE_ID` env var
-- **Bold Formatting**: Birthday names displayed in bold markdown
-- **Error Resilience**: Skips invalid dates, logs warnings, retries next day on failures
-- **Conditional Loading**: Cog only loads when `BIRTHDAY_CHANNEL_ID` and `BIRTHDAY_SPREADSHEET_ID` are set
-
-### Caching Strategy
-1. **Memory Layer**: LRU cache for frequently accessed data
-2. **File Layer**: Persistent storage with size management
-3. **Multi-Level**: Automatic promotion/demotion between layers
-4. **Cleanup Tasks**: Hourly maintenance and size enforcement
-5. **Performance Monitoring**: Cache hit rates and statistics
-
-## Setup and Deployment
-
-### Prerequisites
-- Python 3.8+
-- Required Python packages (see dependencies)
-- Discord bot token
-- Google Service Account JSON for birthday feature
-- Proper file system permissions for cache directories
-
-### Installation Steps
-1. Set required environment variables (minimum: `DISCORD_TOKEN`)
-2. Install dependencies: `pip install -r requirements.txt`
-3. Place Google Service Account JSON in `config/google_credentials.json` (for birthday feature)
-4. Run: `python bot.py`
-
-### Dependencies (requirements.txt)
-- `discord.py>=2.3.0` - Discord API wrapper
-- `gspread>=6.0.0` - Google Sheets API client
-- `google-auth>=2.0.0` - Google authentication
-- `aiohttp>=3.8.0` - Async HTTP requests
-- `psutil>=5.9.0` - System metrics
-- `feedparser>=6.0.10` - RSS/Atom feed parsing
-- `requests>=2.31.0` - Synchronous HTTP (validation)
-- `PyYAML>=6.0` - Configuration file support
-- `pytz>=2023.3` - Timezone handling for German time
-
-### System Requirements
-- **Memory**: 256MB+ recommended
-- **Disk**: 50MB+ for cache and logs
-- **Network**: Stable internet connection for Discord API and Google Sheets
-
-### Bot Permissions Required
-- Send Messages
-- Use Slash Commands  
-- Manage Messages (for clear command)
-- Read Message History
-- Use External Emojis
-- Manage Roles (for auto-join role)
-- Manage Events (for creating Discord scheduled events)
-- View Audit Log (for moderation logging)
-
-## Development Notes
-
-### Architecture Principles
-- **Modular Design**: Clear separation of concerns
-- **Configuration-Driven**: Environment-based configuration
-- **Performance-First**: Multi-layer caching and connection pooling
-- **Reliability**: Comprehensive validation and error handling
-- **Observability**: Detailed logging and metrics
-
-### Code Quality
-- Type hints throughout for better maintainability
-- Async/await patterns for optimal performance
-- Comprehensive error handling with graceful degradation
-- Resource management with proper cleanup
-- Consistent logging and monitoring
-
-### Recent Improvements (2026-02)
-- **Added Birthday Reminder System**: Daily Google Spreadsheet check at 10:00 German time, posts birthday embeds with custom emote
-- **Removed Map System**: Deleted Germany map cog and all related files (map_gen, map_config, map_storage, map_views, shapefiles), removed geopandas/shapely/Pillow dependencies
-
-### Previous Improvements (2025-09)
-- **Fixed CS Score Tracking Duplicates**: Enhanced persistent storage to prevent duplicate score tracking messages across bot restarts
-- **Improved Weekly Summary System**: Continuous weekly message updates instead of weekly-only posting, with proper current week filtering  
-- **Enhanced Match Monitoring**: Better duplicate prevention and real-time synchronization of weekly overviews
-- **Fixed Discord Event Auto-Ending (2025-09-23)**: Implemented automatic event ending when matches disappear from API response, eliminating reliance on unreliable `end_time` field from API
-- **Fixed CS Score Confirmation Bug (2025-09-23)**: Manual score input now properly shows map completion confirmation view when winning scores are reached, matching increment button behavior
-- **Fixed API Data Validation (2025-10-14)**: Enhanced EsportsMatch constructor with proper null checking to handle incomplete match data from wannspieltbig.de API, eliminating recurring "NoneType object is not subscriptable" errors
-
-### Production Considerations
-- Environment variable configuration (never hardcode secrets)
-- Log rotation and size management
-- Resource monitoring and cleanup
-- Graceful shutdown handling
-- Network resilience with automatic retries and exponential backoff
-- Enhanced error handling for API timeouts and connection issues
-- User-friendly interfaces with interactive components instead of command parameters
-
-## Troubleshooting
-
-### Log Analysis
-Application logs are stored in the `/logs` directory with automatic rotation:
-- `roaringbot.log` - Current day's logs
-- `roaringbot.log.YYYY-MM-DD` - Historical logs
-
-### Common Issues
-1. **Discord Event Start Failures**: "Channel already has an active event"
-   - **Cause**: Multiple events trying to use the same voice channel
-   - **Resolution**: Fixed in 2025-09-23 update with improved event lifecycle management
-
-2. **Network Timeouts**: "Timeout on reading data from socket"
-   - **Cause**: Temporary network issues with wannspieltbig.de API
-   - **Resolution**: Automatic retry logic with exponential backoff
-
-3. **Missing Map IDs**: "No map ID available for match"
-   - **Cause**: CS match data incomplete from API
-   - **Resolution**: Graceful degradation - tracking continues without API updates
-
-4. **API Data Errors**: "NoneType object is not subscriptable" (Fixed 2025-10-14)
-   - **Cause**: wannspieltbig.de API returning match entries with missing tournament/team data
-   - **Resolution**: Enhanced EsportsMatch constructor with proper null checking and descriptive error messages
-
-5. **PyNaCl Warning**: "PyNaCl is not installed, voice will NOT be supported"
-   - **Status**: Expected behavior - bot doesn't require voice functionality
+## Recent changes
+- **2026-07-10**: CS score tracker, match reminder, weekly summary and
+  birthday post migrated to **Components V2** (weekly summary switches
+  lazily with the first new-week post). Reminder gallery shows both team
+  logos; `big_square.png` added. `/wannspieltbig_*` commands and the dead
+  `CSGameTracker.get_reminder_embed` removed; `LOG_WEBHOOK_URL` dropped.
+  Member-log join embeds got a "Profil" link button. Dashboard's
+  `next_matches` is no longer week-capped (always the next three).
+- **2026-07-08/09** (Sonnet session): Postgres persistence (`db/`,
+  `roaringbot-db`) replacing the JSON files; structured status reporting for
+  the dashboard (`core/status_reporter.py`, DATA_INTERFACE.md) replacing
+  Discord webhook logging; Kassenbuch cog ported from the BearsFinanz cron
+  script; reminder forum threads; event-lifecycle hardening (NotFound
+  double-check, reschedule-while-active, startup reconciliation); fixed
+  `first_map_at`/`last_map_end` timezone semantics.
+- **2026-02**: birthday cog added; map system removed.

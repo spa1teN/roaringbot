@@ -1,6 +1,7 @@
 # Environment & secrets
 .env*
 config/google_credentials.json
+config/kassenbuch_credentials.json
 
 # Runtime data (server-specific, transferred manually)
 config/esports_data.json
