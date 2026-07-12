@@ -12,4 +12,5 @@ COPY db/ db/
 COPY scripts/ scripts/
 COPY big.png big_square.png pb.png ./
 
+EXPOSE 8080
 CMD ["python", "bot.py"]

@@ -33,13 +33,15 @@ services:
       - DB_NAME=${DB_NAME:-roaringbot}
       - DB_USER=${DB_USER:-roaringbot}
       - DB_PASSWORD=${DB_PASSWORD:?Database password required}
+    expose:
+      - "8080"
     volumes:
       - ./config:/app/config
       - ./logs:/app/logs
       - ./data:/app/data
     networks:
       - roaringbot-network
-
+      - dashboard-network
 volumes:
   postgres_data:
     name: roaringbot-postgres-data
@@ -48,3 +50,6 @@ networks:
   roaringbot-network:
     name: roaringbot-network
     driver: bridge
+  dashboard-network:
+    name: dashboard-network
+    external: true

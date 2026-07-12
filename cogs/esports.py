@@ -1,7 +1,10 @@
 """E-Sports Match Monitoring Cog for Discord Bot"""
 
 import asyncio
+import io
 import logging
+import re
+import urllib.parse
 from datetime import datetime, timedelta, timezone, time
 from typing import Dict, List, Optional, Set, Tuple
 import pytz
@@ -105,12 +108,11 @@ class EsportsMatch:
         else:
             game_emoji = "🎮"
         
-        hltv_line = f"\n🔗  {self.hltv_url}" if self.game == "cs" and self.hltv_url else ""
+        hltv_line = f"\n🔗  [HLTV]({self.hltv_url})" if self.game == "cs" and self.hltv_url else ""
         return (
-            f"--------------------------\n\n"
             f"🏆  **{self.tournament_name}**\n\n"
             f"{game_emoji}  {game_name} - BO{self.bestof}\n\n"
-            f"{self.detail_url}{hltv_line}\n\n"
+            f"[wannspieltbig]({self.detail_url}){hltv_line}\n\n"
         )
     
     def __eq__(self, other):
@@ -259,19 +261,89 @@ CS_EMOTE = "<:cs:1416235161594499092>"
 GAME_EMOJI = {"cs": CS_EMOTE, "lol": "<:lol:1416235138307854416>", "tm": "🏎️"}
 
 
-def build_reminder_view(match: "EsportsMatch", guild_id: Optional[int], mention: Optional[str] = None) -> discord.ui.LayoutView:
-    """CV2 reminder message: both team logos as a gallery, title with live
-    countdown, link buttons (Join Event / wannspieltbig / HLTV). Expects
-    big.png to be attached to the message (attachment://big.png)."""
+VERSUS_SIZE = (1600, 800)  # 2:1 — fills the container width without towering
+VERSUS_PAD = 80
+EVENT_COVER_SIZE = (1600, 400)  # 4:1 — Discord event cover thumbnail
+EVENT_COVER_PAD = 40
+EVENT_COVER_SCALE = 0.7   # logos at 70 % of their box-fit size
+EVENT_COVER_SHIFT = 0.25  # fraction of half-width to shift each logo inward
+
+
+def compose_versus_image(opponent_png: bytes) -> bytes:
+    """Composite the club logo (left half) and the opponent logo (right half)
+    onto one transparent 2:1 canvas for the reminder gallery."""
+    from PIL import Image
+
+    W, H = VERSUS_SIZE
+    canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    big = Image.open("big.png").convert("RGBA")
+    opponent = Image.open(io.BytesIO(opponent_png)).convert("RGBA")
+
+    half = W // 2
+    box_w, box_h = half - 2 * VERSUS_PAD, H - 2 * VERSUS_PAD
+
+    def fit(img):
+        r = min(box_w / img.width, box_h / img.height)
+        return img.resize((max(1, int(img.width * r)), max(1, int(img.height * r))), Image.LANCZOS)
+
+    big_f, opp_f = fit(big), fit(opponent)
+    canvas.paste(big_f, (VERSUS_PAD + (box_w - big_f.width) // 2, (H - big_f.height) // 2), big_f)
+    canvas.paste(opp_f, (half + VERSUS_PAD + (box_w - opp_f.width) // 2, (H - opp_f.height) // 2), opp_f)
+
+    out = io.BytesIO()
+    canvas.save(out, format="PNG")
+    return out.getvalue()
+
+
+def compose_event_cover_image(opponent_png: bytes) -> bytes:
+    """Composite the club logo and opponent logo onto a 4:1 canvas for the
+    Discord event cover thumbnail — logos are smaller and pulled closer
+    together than the 2:1 reminder variant."""
+    from PIL import Image
+
+    W, H = EVENT_COVER_SIZE
+    canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    big = Image.open("big.png").convert("RGBA")
+    opponent = Image.open(io.BytesIO(opponent_png)).convert("RGBA")
+
+    half = W // 2
+    box_w, box_h = half - 2 * EVENT_COVER_PAD, H - 2 * EVENT_COVER_PAD
+
+    def fit(img):
+        r = min(box_w / img.width, box_h / img.height) * EVENT_COVER_SCALE
+        return img.resize((max(1, int(img.width * r)), max(1, int(img.height * r))), Image.LANCZOS)
+
+    big_f, opp_f = fit(big), fit(opponent)
+    shift = int(half * EVENT_COVER_SHIFT)
+    # Left logo: in left half, shifted inward
+    canvas.paste(big_f, (EVENT_COVER_PAD + shift + (box_w - big_f.width) // 2, (H - big_f.height) // 2), big_f)
+    # Right logo: in right half, shifted inward
+    canvas.paste(opp_f, (half + EVENT_COVER_PAD - shift + (box_w - opp_f.width) // 2, (H - opp_f.height) // 2), opp_f)
+
+    out = io.BytesIO()
+    canvas.save(out, format="PNG")
+    return out.getvalue()
+
+
+def build_reminder_view(match: "EsportsMatch", guild_id: Optional[int], mention: Optional[str] = None,
+                        versus: bool = False) -> discord.ui.LayoutView:
+    """CV2 reminder message: title with live countdown, link buttons
+    (Voice → Discord event / wannspieltbig). With versus=True the gallery
+    shows the composed 2:1 both-logos image (attachment://versus.png),
+    otherwise the club logo (attachment://big.png) plus the opponent's
+    logo URL as separate tiles."""
     unix_ts = int(match.start_time.timestamp())
     game_emoji = GAME_EMOJI.get(match.game, "🎮")
 
     container = discord.ui.Container(accent_colour=discord.Colour(0xFF6B35))
 
     gallery = discord.ui.MediaGallery()
-    gallery.add_item(media="attachment://big.png")
-    if match.team_b_logo_url:
-        gallery.add_item(media=match.team_b_logo_url)
+    if versus:
+        gallery.add_item(media="attachment://versus.png")
+    else:
+        gallery.add_item(media="attachment://big.png")
+        if match.team_b_logo_url:
+            gallery.add_item(media=match.team_b_logo_url)
     container.add_item(gallery)
 
     container.add_item(discord.ui.TextDisplay(
@@ -284,12 +356,10 @@ def build_reminder_view(match: "EsportsMatch", guild_id: Optional[int], mention:
     row = discord.ui.ActionRow()
     if match.discord_event_id and guild_id:
         row.add_item(discord.ui.Button(
-            style=discord.ButtonStyle.link, label="Join Event",
+            style=discord.ButtonStyle.link, label="Voice",
             url=f"https://discord.com/events/{guild_id}/{match.discord_event_id}",
         ))
-    row.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="wannspieltbig.de", url=match.detail_url))
-    if match.game == "cs" and match.hltv_url:
-        row.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="HLTV", url=match.hltv_url))
+    row.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="wannspieltbig", url=match.detail_url))
     container.add_item(row)
 
     view = discord.ui.LayoutView(timeout=None)
@@ -657,6 +727,7 @@ class EsportsCog(commands.Cog):
         self.reminder_to_match: Dict[int, int] = {}  # Reminder message ID -> match ID
         self.thread_to_match: Dict[int, int] = {}  # Forum thread ID -> match ID
         self.event_start_failures: Dict[int, int] = {}  # event ID -> consecutive failure count
+        self._versus_cache: Dict[int, Tuple[str, bytes]] = {}  # match ID -> (logo URL, composed PNG)
         self.event_not_found_count: Dict[int, int] = {}  # event ID -> consecutive NotFound count
         self._event_status_by_match: Dict[int, discord.EventStatus] = {}  # match ID -> last observed Discord event status (this poll)
         self.summary_message_id: Optional[int] = None  # Latest summary message ID
@@ -1046,6 +1117,11 @@ class EsportsCog(commands.Cog):
                 if not matchmaps:
                     continue
 
+                # Keep the tracker's map metadata fresh — played_map (the map
+                # name) can be filled in after tracking started, and the
+                # tracker.match object is a snapshot from tracking start.
+                tracker.match.matchmaps = matchmaps
+
                 # Calculate map scores from API data
                 team_a_maps = 0
                 team_b_maps = 0
@@ -1056,34 +1132,27 @@ class EsportsCog(commands.Cog):
                     rounds_a = mm.get("rounds_won_team_a", 0) or 0
                     rounds_b = mm.get("rounds_won_team_b", 0) or 0
 
-                    # Check if this map is finished (someone reached winning score)
-                    # Standard: 13 rounds, OT: 16, 19, 22, etc.
-                    map_finished = False
-                    if rounds_a >= 13 or rounds_b >= 13:
-                        # Check for overtime scenarios
-                        if rounds_a >= 13 and rounds_b < rounds_a - 1:
-                            map_finished = True
-                            if rounds_a > rounds_b:
-                                team_a_maps += 1
-                            else:
-                                team_b_maps += 1
-                        elif rounds_b >= 13 and rounds_a < rounds_b - 1:
-                            map_finished = True
-                            if rounds_b > rounds_a:
-                                team_b_maps += 1
-                            else:
-                                team_a_maps += 1
-                        elif rounds_a >= 13 and rounds_a > rounds_b and (rounds_a - rounds_b) >= 2:
-                            map_finished = True
-                            team_a_maps += 1
-                        elif rounds_b >= 13 and rounds_b > rounds_a and (rounds_b - rounds_a) >= 2:
-                            map_finished = True
-                            team_b_maps += 1
+                    # A map is finished only when the leader has reached the
+                    # current target score: 13 in regulation, then 16, 19, 22,…
+                    # in overtime. The target escalates while the trailing team
+                    # keeps within one round of it (12:12 -> first to 16,
+                    # 15:15 -> first to 19, …) — an intermediate OT score like
+                    # 17:15 is NOT a finished map, even with a 2-round lead.
+                    leader = max(rounds_a, rounds_b)
+                    trailer = min(rounds_a, rounds_b)
+                    target = 13
+                    while trailer >= target - 1:
+                        target += 3
+                    map_finished = leader >= target
 
                     if not map_finished:
                         current_map_idx = i
                         break
                     else:
+                        if rounds_a > rounds_b:
+                            team_a_maps += 1
+                        else:
+                            team_b_maps += 1
                         api_history.append({
                             "map": i + 1,
                             "name": (mm.get("played_map") or {}).get("name"),
@@ -1105,6 +1174,7 @@ class EsportsCog(commands.Cog):
                                  f"{tracker.team_a_maps}-{tracker.team_b_maps} -> {team_a_maps}-{team_b_maps}")
                     tracker.team_a_maps = team_a_maps
                     tracker.team_b_maps = team_b_maps
+                    status_reporter.bump_counter("esports", "score_updates_from_api")
                     scores_changed = True
 
                 # Update current map scores
@@ -1130,6 +1200,7 @@ class EsportsCog(commands.Cog):
                         tracker.team_a_score = api_team_a_score
                         tracker.team_b_score = api_team_b_score
                         tracker._update_overtime_target()
+                        status_reporter.bump_counter("esports", "score_updates_from_api")
                         scores_changed = True
 
                 # Check if match is finished — require actual map score to confirm,
@@ -1175,6 +1246,7 @@ class EsportsCog(commands.Cog):
                         "match_id": mid,
                         "teams": f"{t.match.team_a} vs {t.match.team_b}",
                         "map": t.current_map,
+                        "map_name": t.map_name(t.current_map),
                         "score": f"{t.team_a_score}-{t.team_b_score}",
                         "maps": f"{t.team_a_maps}-{t.team_b_maps}",
                         "is_finished": t.is_finished,
@@ -1321,21 +1393,65 @@ class EsportsCog(commands.Cog):
 
     def _event_target_start(self, match: "EsportsMatch") -> datetime:
         """The Discord event should go live 5 minutes before the real kickoff.
-        Clamped to a few seconds in the future so Discord's API (which rejects
-        a past/immediate start_time) never errors out for matches discovered
-        with less than 5 minutes' notice.
+        This is the nominal target used for "is it due yet?" checks — it must
+        NOT be clamped to the future, otherwise the auto-start condition
+        (target <= now) can never become true.
         """
-        target = match.start_time - self.EVENT_START_LEAD
+        return match.start_time - self.EVENT_START_LEAD
+
+    def _event_api_start_time(self, match: "EsportsMatch") -> datetime:
+        """The start_time to send to Discord when creating/editing an event:
+        the nominal target clamped to a few seconds in the future, because
+        Discord's API rejects a past/immediate start_time (relevant for
+        matches discovered with less than 5 minutes' notice).
+        """
         floor = datetime.now(timezone.utc) + timedelta(seconds=30)
-        return max(target, floor)
+        return max(self._event_target_start(match), floor)
 
     def _event_end_time(self, match: "EsportsMatch") -> datetime:
-        """Sensible scheduled end time: the (correctly parsed) API estimate
-        from last_map_end if present, else start + 1h per best-of map —
-        mirrors the API's own apparent estimation formula. Always relative
-        to the real kickoff, not the 5-minutes-early event start.
+        """Generous end-time estimate: 90 min per best-of map + 90 min slack.
+        This is only a Discord scheduling hint — the real finish is detected
+        by the CS live-score loop or the match disappearing from the API."""
+        maps = max(match.bestof, 1)
+        return match.start_time + timedelta(minutes=90) * maps + timedelta(minutes=90)
+
+    SCHEDULE_RECONCILE_TOLERANCE = timedelta(seconds=60)
+    SCHEDULE_RECONCILE_MIN_LEAD = timedelta(minutes=2)
+
+    async def _reconcile_event_schedule(self, event: discord.ScheduledEvent, match: "EsportsMatch", now: datetime):
+        """Nudge a still-scheduled event's start/end back onto the current
+        formula (start = kickoff − 5 min, generous end) when it has drifted —
+        typically legacy events created before a formula change. No-op (and no
+        API call) when already aligned, so this is free on every poll once the
+        backlog is fixed. Skipped in the last couple of minutes before the
+        intended start so it never races the auto-start or fights the
+        now+30 s clamp.
         """
-        return match.end_time or (match.start_time + timedelta(hours=max(1, match.bestof)))
+        target_start = self._event_target_start(match)  # unclamped intended start
+        if target_start <= now + self.SCHEDULE_RECONCILE_MIN_LEAD:
+            return
+        target_end = self._event_end_time(match)
+
+        start_off = (event.start_time is None or
+                     abs(event.start_time - target_start) > self.SCHEDULE_RECONCILE_TOLERANCE)
+        end_off = (event.end_time is None or
+                   abs(event.end_time - target_end) > self.SCHEDULE_RECONCILE_TOLERANCE)
+        if not (start_off or end_off):
+            return
+
+
+        try:
+            await event.edit(
+                start_time=self._event_api_start_time(match),
+                end_time=target_end,
+            )
+            self.log.info(
+                f"Reconciled event {event.id} schedule for match {match.id} "
+                f"({match.event_name}): start->{target_start:%Y-%m-%d %H:%M}Z "
+                f"end->{target_end:%H:%M}Z"
+            )
+        except Exception as e:
+            self.log.warning(f"Could not reconcile event {event.id} for match {match.id}: {e}")
 
     def _match_health_issues(self, match: "EsportsMatch", now: datetime) -> List[str]:
         """Detect and log discrepancies between what should exist for an
@@ -1392,6 +1508,7 @@ class EsportsCog(commands.Cog):
                 tracker = self.active_cs_games[m.id]
                 live_score = {
                     "map": tracker.current_map,
+                    "map_name": tracker.map_name(tracker.current_map),
                     "score": f"{tracker.team_a_score}-{tracker.team_b_score}",
                     "maps": f"{tracker.team_a_maps}-{tracker.team_b_maps}",
                 }
@@ -1453,8 +1570,9 @@ class EsportsCog(commands.Cog):
             
             # Event should go live 5 minutes before the real kickoff; the end
             # time stays relative to the real kickoff (see _event_end_time).
-            event_start_time = self._event_target_start(match)
+            event_start_time = self._event_api_start_time(match)
             end_time = self._event_end_time(match)
+            versus_bytes = await self._build_event_cover_media(match)
 
             # Determine voice channel and entity type
             voice_channel = None
@@ -1473,6 +1591,7 @@ class EsportsCog(commands.Cog):
                     entity_type = discord.EntityType.voice
                     location = None
 
+            versus_bytes = await self._build_reminder_media(match)
             # Create the event
             if entity_type == discord.EntityType.voice and voice_channel:
                 event = await guild.create_scheduled_event(
@@ -1482,7 +1601,8 @@ class EsportsCog(commands.Cog):
                     end_time=end_time,
                     entity_type=entity_type,
                     channel=voice_channel,
-                    privacy_level=discord.PrivacyLevel.guild_only
+                    privacy_level=discord.PrivacyLevel.guild_only,
+                    image=versus_bytes
                 )
             else:
                 event = await guild.create_scheduled_event(
@@ -1492,7 +1612,8 @@ class EsportsCog(commands.Cog):
                     end_time=end_time,
                     entity_type=discord.EntityType.external,
                     location="wannspieltbig.de",
-                    privacy_level=discord.PrivacyLevel.guild_only
+                    privacy_level=discord.PrivacyLevel.guild_only,
+                    image=versus_bytes
                 )
             
             # Store the mapping
@@ -1554,7 +1675,7 @@ class EsportsCog(commands.Cog):
             
             # Event should go live 5 minutes before the real kickoff; the end
             # time stays relative to the real kickoff (see _event_end_time).
-            event_start_time = self._event_target_start(match)
+            event_start_time = self._event_api_start_time(match)
             end_time = self._event_end_time(match)
 
             # Determine voice channel and entity type
@@ -1892,91 +2013,10 @@ class EsportsCog(commands.Cog):
             # Sort by start time
             upcoming_matches.sort(key=lambda m: m.start_time)
 
-            # Lazy format switch: messages posted after the CV2 change are
-            # edited as CV2; a pre-existing embed message keeps the legacy
-            # rendering until the next regular re-post (new week) replaces it.
+            # Edit the existing CV2 message in place.
             message = await channel.fetch_message(self.summary_message_id)
-            if message.flags.components_v2:
-                view = build_weekly_view(upcoming_matches, week_start, week_end, channel.guild, self.germany_tz)
-                await message.edit(view=view, attachments=[discord.File("big_square.png", filename="big_square.png")])
-                self.log.info(f"Updated weekly summary message {self.summary_message_id}")
-                status_reporter.record(
-                    "esports",
-                    weekly_summary_last_updated=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    weekly_summary_message_id=self.summary_message_id,
-                    weekly_summary_last_error=None,
-                )
-                return
-
-            # Create updated embed (legacy rendering, drops out with the next new week)
-            week_start_str = week_start.strftime("%B %d")
-            week_end_str = (week_end - timedelta(days=1)).strftime("%B %d")
-            embed = discord.Embed(
-                title=f"This Week ({week_start_str} - {week_end_str}) • {len(upcoming_matches)} matches",
-                color=0x00ff88
-            )
-            embed.set_thumbnail(url="attachment://big.png")
-            
-            powered_by = "-# Powered by [wannspieltbig.de](https://wannspieltbig.de)"
-
-            if not upcoming_matches:
-                embed.add_field(
-                    name="No Matches Scheduled",
-                    value="No matches are scheduled for this week.",
-                    inline=False
-                )
-                embed.add_field(name="​", value=powered_by, inline=False)
-            else:
-                # Group matches by day
-                matches_by_day = {}
-                for match in upcoming_matches:
-                    match_time_berlin = match.start_time.astimezone(self.germany_tz)
-                    day_key = match_time_berlin.strftime("%A, %B %d")
-
-                    if day_key not in matches_by_day:
-                        matches_by_day[day_key] = []
-                    matches_by_day[day_key].append((match, match_time_berlin))
-
-                # Add fields for each day; append powered_by to the last day's field
-                days_list = list(matches_by_day.items())
-                for i, (day, day_matches) in enumerate(days_list):
-                    match_lines = []
-                    for match, match_time in day_matches:
-                        time_str = match_time.strftime("%H:%M")
-
-                        # Use custom emotes for specific games
-                        if match.game == "cs":
-                            game_emoji = "<:cs:1416235161594499092>"
-                        elif match.game == "lol":
-                            game_emoji = "<:lol:1416235138307854416>"
-                        elif match.game == "tm":
-                            game_emoji = "🏎️"
-                        else:
-                            game_emoji = "🎮"
-
-                        # Create clickable link to Discord event if event exists
-                        if match.discord_event_id:
-                            guild = channel.guild
-                            if guild:
-                                event_url = f"https://discord.com/events/{guild.id}/{match.discord_event_id}"
-                                match_line = f"{game_emoji} **[{time_str} - {match.team_a} vs {match.team_b}]({event_url})**"
-                            else:
-                                match_line = f"{game_emoji} **{time_str} - {match.team_a} vs {match.team_b}**"
-                        else:
-                            match_line = f"{game_emoji} **{time_str} - {match.team_a} vs {match.team_b}**"
-
-                        match_lines.append(match_line)
-
-                    value = "\n".join(match_lines)
-                    if i == len(days_list) - 1:
-                        value += f"\n\n{powered_by}"
-                    embed.add_field(name=f"{day}", value=value, inline=False)
-            
-            # Update the existing message
-            message = await channel.fetch_message(self.summary_message_id)
-            file = discord.File("big.png", filename="big.png")
-            await message.edit(embed=embed, attachments=[file])
-            
+            view = build_weekly_view(upcoming_matches, week_start, week_end, channel.guild, self.germany_tz)
+            await message.edit(view=view, attachments=[discord.File("big_square.png", filename="big_square.png")])
             self.log.info(f"Updated weekly summary message {self.summary_message_id}")
             status_reporter.record(
                 "esports",
@@ -2058,6 +2098,7 @@ class EsportsCog(commands.Cog):
             try:
                 if response.status in [200, 204]:
                     self.log.info(f"Successfully updated scores for match {tracker.match.id}, map {tracker.current_map}")
+                    status_reporter.bump_counter("esports", "score_updates_to_api")
                 else:
                     self.log.error(f"Failed to update scores: HTTP {response.status}")
                     error_text = await response.text()
@@ -2220,25 +2261,25 @@ class EsportsCog(commands.Cog):
                         await self._save_data()
                         # Recreate the event so the match still has a Discord presence
                         await self._create_discord_event(match)
-            
-            # Check if event should be ended
-            elif (event.status == discord.EventStatus.active and 
-                  match.end_time and match.end_time <= now):
-                try:
-                    await event.end()
-                    self.log.info(f"Ended Discord event {event_id} for match {match_id}: {match.event_name}")
-                except Exception as e:
-                    self.log.error(f"Failed to end event {event_id}: {e}")
-            
-            # Auto-end events that have been active for more than 4 hours (fallback)
-            elif (event.status == discord.EventStatus.active and
-                  (now - match.start_time).total_seconds() > 14400):  # 4 hours
-                try:
-                    await event.end()
-                    self.log.info(f"Auto-ended Discord event {event_id} after 4 hours for match {match_id}")
-                except Exception as e:
-                    self.log.error(f"Failed to auto-end event {event_id}: {e}")
-    
+
+            # Not yet due to start: keep the scheduled start/end aligned with
+            # the current formula, so events created by older code (or before a
+            # formula change) self-correct instead of lingering with stale
+            # times — e.g. legacy events whose start sat at the real kickoff
+            # instead of kickoff − 5 min.
+            elif event.status == discord.EventStatus.scheduled:
+                await self._reconcile_event_schedule(event, match, now)
+
+            # NOTE: events are deliberately NOT ended on a time estimate here.
+            # Ending is driven exclusively by wannspieltbig: the CS live-score
+            # loop ends the event on the real match finish (map score reached
+            # or has_ended), and any match that leaves the API is ended via
+            # _handle_match_finished. The API's last_map_end proved unreliable
+            # (BIG vs Parivision ended a 3-hour estimate short while the match
+            # was still on map 3), so if a finish signal is ever missed the
+            # event simply lingers until it is ended manually — an accepted
+            # trade-off vs. cutting a live match's event short.
+
     async def _start_cs_game_tracking(self, match: EsportsMatch):
         """Start tracking a CS game"""
         try:
@@ -2296,11 +2337,92 @@ class EsportsCog(commands.Cog):
                 if 1740 <= time_to_start <= 1800:  # 29-30 minutes
                     await self._send_match_reminder(match, channel)
     
+    REMINDER_PING_DELAY = 30  # seconds between reminder message and role ping
+
+    async def _build_reminder_media(self, match: EsportsMatch) -> Optional[bytes]:
+        """The composed 2:1 versus image for the reminder, or None when it
+        can't be built (no opponent logo / proxy failure) — the caller then
+        falls back to the plain gallery. The opponent logo is fetched through
+        the images.weserv.nl proxy because HLTV's CDN blocks server IPs;
+        results are cached per match so reschedule edits don't re-fetch."""
+        if not match.team_b_logo_url:
+            return None
+        cached = self._versus_cache.get(match.id)
+        if cached and cached[0] == match.team_b_logo_url:
+            return cached[1]
+        try:
+            proxy_url = (
+                "https://images.weserv.nl/?url="
+                + urllib.parse.quote(re.sub(r"^https?://", "", match.team_b_logo_url), safe="")
+                + "&w=400"
+            )
+            response = await http_client.get(proxy_url)
+            try:
+                if response.status != 200:
+                    self.log.warning(f"Logo proxy returned HTTP {response.status} for match {match.id}")
+                    return None
+                logo_bytes = await response.read()
+            finally:
+                await response.release()
+            versus = await asyncio.to_thread(compose_versus_image, logo_bytes)
+            self._versus_cache[match.id] = (match.team_b_logo_url, versus)
+            return versus
+        except Exception as e:
+            self.log.warning(f"Could not build versus image for match {match.id}: {e}")
+            return None
+
+    async def _build_event_cover_media(self, match: EsportsMatch) -> Optional[bytes]:
+        """4:1 variant of the versus image for the Discord event cover.
+        Same opponent-logo fetch + proxy as _build_reminder_media but uses
+        the event-cover composition (smaller logos, pulled closer)."""
+        if not match.team_b_logo_url:
+            return None
+        import asyncio
+        try:
+            proxy_url = (
+                "https://images.weserv.nl/?url="
+                + urllib.parse.quote(re.sub(r"^https?://", "", match.team_b_logo_url), safe="")
+                + "&w=400"
+            )
+            logo_bytes = None
+            response = await http_client.get(proxy_url)
+            try:
+                if response.status == 200:
+                    logo_bytes = await response.read()
+            finally:
+                await response.release()
+            if logo_bytes is None:
+                # Proxy failed — try the raw URL directly
+                self.log.debug(f"Logo proxy failed for match {match.id}, trying direct fetch: {match.team_b_logo_url}")
+                response = await http_client.get(match.team_b_logo_url)
+                try:
+                    if response.status == 200:
+                        logo_bytes = await response.read()
+                finally:
+                    await response.release()
+            if logo_bytes is None:
+                return None
+            return await asyncio.to_thread(compose_event_cover_image, logo_bytes)
+        except Exception as e:
+            self.log.warning(f"Could not build event cover image for match {match.id}: {e}")
+            return None
+
+    async def _send_delayed_ping(self, thread: discord.Thread, mention_text: str, match_id: int):
+        """Users reported missing notifications when the role ping followed the
+        reminder message immediately — give Discord a moment to settle the new
+        thread before pinging."""
+        try:
+            await asyncio.sleep(self.REMINDER_PING_DELAY)
+            await thread.send(content=mention_text)
+        except Exception as e:
+            self.log.error(f"Failed to send delayed reminder ping for match {match_id}: {e}")
+
     async def _edit_reminder_message(self, match: EsportsMatch):
         """Edit an existing reminder message after a reschedule"""
         try:
             guild_id = config.esports_guild_id or (self.bot.guilds[0].id if self.bot.guilds else None)
-            view = build_reminder_view(match, guild_id)
+            versus_bytes = await self._build_reminder_media(match)
+            view = build_reminder_view(match, guild_id, versus=versus_bytes is not None)
 
             message = None
 
@@ -2328,7 +2450,11 @@ class EsportsCog(commands.Cog):
                         pass
 
             if message:
-                await message.edit(view=view, attachments=[discord.File("big.png", filename="big.png")])
+                if versus_bytes is not None:
+                    attachment = discord.File(io.BytesIO(versus_bytes), filename="versus.png")
+                else:
+                    attachment = discord.File("big.png", filename="big.png")
+                await message.edit(view=view, attachments=[attachment])
                 self.log.info(f"Edited reminder for rescheduled match {match.id}: {match.event_name}")
             else:
                 # Message no longer exists — clear tracking so a fresh reminder fires at 30-min mark
@@ -2357,8 +2483,15 @@ class EsportsCog(commands.Cog):
                 mention_text = f"<@&{ping_role_id}>"
 
             guild_id = channel.guild.id if channel.guild else config.esports_guild_id
-            view = build_reminder_view(match, guild_id)
-            reminder_file = discord.File("big.png", filename="big.png")
+            versus_bytes = await self._build_reminder_media(match)
+            versus = versus_bytes is not None
+            view = build_reminder_view(match, guild_id, versus=versus)
+
+            def reminder_file() -> discord.File:
+                # discord.File objects are single-use — build a fresh one per send
+                if versus:
+                    return discord.File(io.BytesIO(versus_bytes), filename="versus.png")
+                return discord.File("big.png", filename="big.png")
 
             # Create/reuse forum thread if configured — ping goes into the thread
             if config.esports_forum_channel_id:
@@ -2376,9 +2509,9 @@ class EsportsCog(commands.Cog):
                             if existing and isinstance(existing, discord.Thread):
                                 if existing.archived:
                                     await existing.edit(archived=False)
-                                msg = await existing.send(view=view, file=reminder_file)
+                                msg = await existing.send(view=view, file=reminder_file())
                                 if mention_text:
-                                    await existing.send(content=mention_text)
+                                    asyncio.create_task(self._send_delayed_ping(existing, mention_text, match.id))
                                 match.reminder_message_id = msg.id
                                 self.reminder_to_match[msg.id] = match.id
                                 await self._save_data()
@@ -2390,20 +2523,20 @@ class EsportsCog(commands.Cog):
                                 self._close_forum_thread(match.forum_thread_id, match.id)
 
                         # No existing thread — create a new one
-                        game_name = {"cs": "Counter-Strike", "tm": "Trackmania", "lol": "League of Legends"}.get(match.game, match.game.upper())
+                        game_name = {"cs": "CS", "tm": "TM", "lol": "LoL"}.get(match.game, match.game.upper())
                         thread_with_msg = await forum_channel.create_thread(
                             name=f"{match.team_a} vs {match.team_b} – {game_name}",
                             view=view,
-                            file=reminder_file,
+                            file=reminder_file(),
                         )
                         forum_thread = thread_with_msg.thread
                         match.forum_thread_id = forum_thread.id
                         self.thread_to_match[forum_thread.id] = match.id
                         match.reminder_message_id = thread_with_msg.message.id
                         self.reminder_to_match[thread_with_msg.message.id] = match.id
-                        # Send ping as separate message so Discord triggers proper notifications
+                        # Send ping as separate, delayed message so Discord triggers proper notifications
                         if mention_text:
-                            await forum_thread.send(content=mention_text)
+                            asyncio.create_task(self._send_delayed_ping(forum_thread, mention_text, match.id))
                         await self._save_data()
                         self.log.info(f"Sent 30-minute reminder (thread) for match {match.id}: {match.event_name}")
                         status_reporter.record(
@@ -2418,8 +2551,8 @@ class EsportsCog(commands.Cog):
             # Fallback: post to games channel if no forum channel configured.
             # CV2 messages cannot carry `content`, so the role ping moves into
             # the container as a small text line.
-            view = build_reminder_view(match, guild_id, mention=mention_text or None)
-            message = await channel.send(view=view, file=discord.File("big.png", filename="big.png"))
+            view = build_reminder_view(match, guild_id, mention=mention_text or None, versus=versus)
+            message = await channel.send(view=view, file=reminder_file())
             match.reminder_message_id = message.id
             self.reminder_to_match[message.id] = match.id
             await self._save_data()
@@ -2494,6 +2627,8 @@ class EsportsCog(commands.Cog):
             if match:
                 match.reminder_message_id = None
             del self.reminder_to_match[reminder_id]
+            if match_id:
+                self._versus_cache.pop(match_id, None)
 
         if reminders_to_delete:
             await self._save_data()

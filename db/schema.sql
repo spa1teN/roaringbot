@@ -30,19 +30,21 @@ CREATE TABLE IF NOT EXISTS guild_timezones (
 -- ============================================
 
 -- Moderation configuration per guild: member-log webhook, auto join role,
--- honeypot role (anyone holding it gets auto-banned).
+-- honeypot role, bot-trap channel.
 CREATE TABLE IF NOT EXISTS moderation_config (
-    guild_id            BIGINT PRIMARY KEY REFERENCES guilds(id) ON DELETE CASCADE,
-    member_log_webhook  TEXT,
-    join_role_id        BIGINT,
-    honeypot_role_id    BIGINT,
-    created_at          TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at          TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    guild_id                BIGINT PRIMARY KEY REFERENCES guilds(id) ON DELETE CASCADE,
+    member_log_webhook      TEXT,
+    member_log_channel_id   BIGINT,
+    join_role_id            BIGINT,
+    honeypot_role_id        BIGINT,
+    bot_trap_channel_id     BIGINT,
+    created_at              TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at              TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- ============================================
--- E-SPORTS (wannspieltbig.de match monitoring)
--- ============================================
+-- Migration: add columns if upgrading from older schema.
+ALTER TABLE moderation_config ADD COLUMN IF NOT EXISTS member_log_channel_id BIGINT;
+ALTER TABLE moderation_config ADD COLUMN IF NOT EXISTS bot_trap_channel_id BIGINT;
 
 -- Discord scheduled-event ID -> internal wannspieltbig match ID
 CREATE TABLE IF NOT EXISTS esports_event_map (
@@ -106,6 +108,28 @@ CREATE TABLE IF NOT EXISTS birthday_sent_log (
     sent_at         TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     UNIQUE (guild_id, name, date_iso)
 );
+
+-- ============================================
+-- FEEDBACK
+-- ============================================
+
+-- User-submitted feedback via /feedback command.
+CREATE TABLE IF NOT EXISTS feedback (
+    id              SERIAL PRIMARY KEY,
+    guild_id        BIGINT REFERENCES guilds(id) ON DELETE CASCADE,
+    user_id         BIGINT NOT NULL,
+    is_anonymous    BOOLEAN NOT NULL DEFAULT FALSE,
+    subject         VARCHAR(32) NOT NULL DEFAULT 'other',
+    message         TEXT NOT NULL,
+    status          VARCHAR(16) NOT NULL DEFAULT 'new',   -- new | important | in_progress | archived
+    read            BOOLEAN NOT NULL DEFAULT FALSE,
+    admin_note      TEXT,
+    created_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Migration: add columns if upgrading from schema without status/admin_note.
+ALTER TABLE feedback ADD COLUMN IF NOT EXISTS status VARCHAR(16) NOT NULL DEFAULT 'new';
+ALTER TABLE feedback ADD COLUMN IF NOT EXISTS admin_note TEXT;
 
 -- ============================================
 -- INDEXES

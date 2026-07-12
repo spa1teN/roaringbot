@@ -235,12 +235,18 @@ class BirthdayCog(commands.Cog):
             except ValueError:
                 continue  # e.g. 29.02 in a non-leap year
 
-            upcoming.append({
+            entry = {
                 "name": discord_name,
                 "date": parsed.strftime("%d.%m"),
                 "date_iso": next_date.isoformat(),
                 "days_until": (next_date - today).days,
-            })
+            }
+            # Birth year is only present for full "dd.mm.yyyy" entries (2-part
+            # dates default to year 1900). Expose the age they're turning so the
+            # dashboard can show it.
+            if len(parts) == 3 and 1900 <= parsed.year <= today.year:
+                entry["turning_age"] = next_date.year - parsed.year
+            upcoming.append(entry)
 
         upcoming.sort(key=lambda u: u["days_until"])
         return upcoming[:limit]
@@ -276,12 +282,15 @@ class BirthdayCog(commands.Cog):
 
             days_since = (today - occurrence).days
             if 0 <= days_since <= days_back:
-                recent.append({
+                entry = {
                     "name": discord_name,
                     "date": parsed.strftime("%d.%m"),
                     "date_iso": occurrence.isoformat(),
                     "days_since": days_since,
-                })
+                }
+                if len(parts) == 3 and 1900 <= parsed.year <= today.year:
+                    entry["turned_age"] = occurrence.year - parsed.year
+                recent.append(entry)
 
         recent.sort(key=lambda r: r["days_since"])
         return recent

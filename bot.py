@@ -16,6 +16,7 @@ from core.cache_manager import cache_manager
 from core.http_client import http_client
 from core.validation import run_full_validation, log_validation_results
 from core.status_reporter import status_reporter
+from core.api_server import start_api_server
 from db import get_db
 
 from dotenv import load_dotenv
@@ -76,7 +77,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-COGS = ["cogs.moderation", "cogs.esports", "cogs.birthday", "cogs.finance"]
+COGS = ["cogs.moderation", "cogs.esports", "cogs.birthday", "cogs.finance", "cogs.feedback"]
 
 # ─── Enhanced Bot-Klasse ────────────────────────────────────────────────────
 class RoaringBot(commands.Bot):
@@ -86,6 +87,8 @@ class RoaringBot(commands.Bot):
         self.cog_loggers: Dict[str, logging.Logger] = {}
         self.owner_id = config.owner_id
         self.db = None  # set in setup_hook once connected
+        self._feedback_stats_task = None
+        self._api_runner = None
 
     def get_cog_logger(self, cog_name: str) -> logging.Logger:
         """Get or create a logger for a specific cog"""
@@ -152,6 +155,8 @@ class RoaringBot(commands.Bot):
 
         status_reporter.record("bot", loaded_cogs=list(self.cogs.keys()))
         await status_reporter.start(asyncio)
+        # Start dashboard API server (port 8080, shares event loop)
+        self._api_runner = await start_api_server(self, port=8080)
 
     async def on_ready(self):
         status = discord.Status.online
@@ -162,15 +167,20 @@ class RoaringBot(commands.Bot):
         #await self.change_presence(status=status, activity=activity)
         log.info(f"🤖 Logged in as {self.user} (ID: {self.user.id})")
         log.info(f"📊 Connected to {len(self.guilds)} guild(s)")
+        total_members = sum(g.member_count for g in self.guilds) if self.guilds else 0
         status_reporter.record(
             "bot",
             user=str(self.user),
             user_id=self.user.id,
             guild_count=len(self.guilds),
+            member_count=total_members,
             latency_ms=round(self.latency * 1000) if self.latency else None,
             gateway_status="connected",
         )
         print("------")
+
+        # Start periodic feedback stats reporter for the dashboard
+        self._feedback_stats_task = asyncio.create_task(self._feedback_stats_loop())
 
     async def on_disconnect(self):
         status_reporter.record("bot", gateway_status="disconnected")
@@ -182,6 +192,88 @@ class RoaringBot(commands.Bot):
             gateway_status="connected",
             latency_ms=round(self.latency * 1000) if self.latency else None,
         )
+
+    async def _feedback_stats_loop(self):
+        """Periodically query feedback table and report stats to status.json."""
+        await asyncio.sleep(10)  # let guilds populate after READY
+        while True:
+            try:
+                if self.db and self.db.is_connected:
+                    stats = await self.db.feedback.get_stats_by_guild()
+                    entries = await self.db.feedback.get_recent_entries(limit=20)
+
+                    # Build guild lookup: id -> (name, avatar_url)
+                    guild_info = {}
+                    for g in self.guilds:
+                        avatar = None
+                        try:
+                            if g.icon:
+                                avatar = str(g.icon.url)
+                        except Exception:
+                            pass
+                        guild_info[g.id] = (g.name, avatar)
+
+                    # Per-guild stats with status breakdown
+                    guilds = []
+                    for row in stats:
+                        gid = row["guild_id"]
+                        name, avatar = guild_info.get(gid, ("Unknown", None))
+                        guilds.append({
+                            "guild_id": str(gid),
+                            "guild_name": name,
+                            "guild_avatar_url": avatar,
+                            "total": row["total"],
+                            "new": row["new"],
+                            "important": row["important"],
+                            "in_progress": row["in_progress"],
+                            "archived": row["archived"],
+                        })
+
+                    # Enrich entries with user/guild info
+                    clean_entries = []
+                    for e in entries:
+                        d = dict(e)
+                        if d.get("created_at"):
+                            d["created_at"] = d["created_at"].isoformat()
+                        gid = d.get("guild_id")
+                        if gid:
+                            name, avatar = guild_info.get(gid, ("Unknown", None))
+                            d["guild_name"] = name
+                            d["guild_avatar_url"] = avatar
+                        uid = d.get("user_id")
+                        if uid and not d.get("is_anonymous"):
+                            user = self.get_user(uid)
+                            if user:
+                                d["user_name"] = user.display_name or user.name
+                                try:
+                                    d["user_avatar_url"] = str(user.avatar.url) if user.avatar else str(user.default_avatar.url)
+                                except Exception:
+                                    d["user_avatar_url"] = None
+                            else:
+                                d["user_name"] = None
+                                d["user_avatar_url"] = None
+                        else:
+                            d["user_name"] = None
+                            d["user_avatar_url"] = None
+                        clean_entries.append(d)
+
+                    # Bot avatar
+                    bot_avatar_url = None
+                    try:
+                        if self.user and self.user.avatar:
+                            bot_avatar_url = str(self.user.avatar.url)
+                    except Exception:
+                        pass
+
+                    status_reporter.record(
+                        "feedback",
+                        guilds=guilds,
+                        entries=clean_entries,
+                        bot_avatar_url=bot_avatar_url,
+                    )
+            except Exception:
+                log.exception("Feedback stats loop error")
+            await asyncio.sleep(60)
 
     async def on_command_error(self, ctx, error):
         """Handle command errors and log them"""
@@ -204,6 +296,13 @@ class RoaringBot(commands.Bot):
         """Cleanup when bot is shutting down"""
         log.info("🔄 Bot is shutting down...")
 
+        # Stop feedback stats loop
+        if self._feedback_stats_task and not self._feedback_stats_task.done():
+            self._feedback_stats_task.cancel()
+            try:
+                await self._feedback_stats_task
+            except asyncio.CancelledError:
+                pass
         status_reporter.record("bot", gateway_status="disconnected")
         try:
             status_reporter.write()
@@ -218,6 +317,11 @@ class RoaringBot(commands.Bot):
         # Stop HTTP client
         await http_client.close()
         log.info("✅ HTTP client closed")
+
+        # Stop API server
+        if self._api_runner:
+            await self._api_runner.cleanup()
+            log.info("✅ API server stopped")
 
         # Close DB pool
         if getattr(self, "db", None):

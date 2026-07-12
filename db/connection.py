@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from db.repositories.guild_repository import GuildRepository
     from db.repositories.esports_repository import EsportsRepository
     from db.repositories.birthday_repository import BirthdayRepository
+    from db.repositories.feedback_repository import FeedbackRepository
 
 log = logging.getLogger("roaringbot.db")
 
@@ -131,6 +132,13 @@ class DatabaseManager:
             from db.repositories.birthday_repository import BirthdayRepository
             self._repositories['birthdays'] = BirthdayRepository(self.pool)
         return self._repositories['birthdays']
+
+    @property
+    def feedback(self) -> 'FeedbackRepository':
+        if 'feedback' not in self._repositories:
+            from db.repositories.feedback_repository import FeedbackRepository
+            self._repositories['feedback'] = FeedbackRepository(self.pool)
+        return self._repositories['feedback']
 
 
 # Global accessor function

@@ -27,6 +27,9 @@ PyYAML>=6.0
 # Timezone Handling
 pytz>=2023.3
 
+# Reminder versus-image compositing
+Pillow>=10.0.0
+
 # Base64 encoding (built-in module, no requirement needed)
 # JSON (built-in module, no requirement needed)
 # Asyncio (built-in module, no requirement needed)

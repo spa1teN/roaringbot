@@ -5,9 +5,10 @@ RoaringBot schreibt alle 15 Sekunden einen vollständigen Status-Snapshot nach
 `/root/roaringbot/data/status.json` auf dem Host — der Ordner ist bereits als
 Volume in `docker-compose.yml` gemountet: `./data:/app/data`).
 
-Das ist die einzige Schnittstelle, die externe Tools (z. B. das Dashboard)
-nutzen sollten, um den Live-Zustand des Bots abzufragen. Kein Log-Parsing
-nötig.
+Das ist die primäre Schnittstelle, die externe Tools (z. B. das Dashboard)
+nutzen sollten, um den Live-Zustand des Bots abzufragen. Für schreibende
+Zugriffe (Feedback-Status ändern, Notizen setzen) gibt es zusätzlich eine
+REST-API — siehe [Feedback API](#feedback-api).
 
 ## Funktionsweise
 
@@ -147,7 +148,8 @@ diese Sektion. `counters`-Objekte liefern rollierende Zählungen der letzten
         "tracking_ok": null,                      // null wenn nicht CS
         "voice_event_at": "2026-07-09T17:55:00Z", // Kickoff - 5min (geclamped auf jetzt+30s)
         "voice_event_ok": true,                   // true sobald der Discord-Event-Status != "scheduled" ist
-        "live_score": null,                       // bei laufendem CS-Match: {"map":1,"score":"7-5","maps":"0-0"}
+        "live_score": null,                       // bei laufendem CS-Match: {"map":1,"map_name":"Cache","score":"7-5","maps":"0-0"}
+                                                  // map_name kann null sein, solange die Map noch nicht feststeht → Anzeige fällt auf "Map N" zurück
         // issues: leer wenn alles ok, sonst eine Teilmenge von:
         // "no_discord_event" | "reminder_missing" | "event_not_started" | "tracking_missing" (nur CS)
         // jedes erkannte Issue wird zusätzlich als log.error geloggt (taucht im Fehler-Log-Graphen auf)
@@ -156,7 +158,10 @@ diese Sektion. `counters`-Objekte liefern rollierende Zählungen der letzten
     ],
     "counters": {
       "api_errors": {"15m": 0, "1h": 0, "24h": 3},
-      "reminder_errors": {"15m": 0, "1h": 0, "24h": 0}
+      "reminder_errors": {"15m": 0, "1h": 0, "24h": 0},
+      // Score-Herkunft des CS-Trackers:
+      "score_updates_from_api": {"15m": 0, "1h": 2, "24h": 35},  // Sync hat Stände von wannspieltbig übernommen
+      "score_updates_to_api": {"15m": 0, "1h": 0, "24h": 0}      // Button-Klicks haben Stände zu wannspieltbig geschrieben (PUT)
     }
   },
 
@@ -167,6 +172,10 @@ diese Sektion. `counters`-Objekte liefern rollierende Zählungen der letzten
     "honeypot_last_error": null,
     "member_log_status": "ok",               // "ok" | "disabled" | "error", zuletzt beobachteter Webhook-Versand
     "member_log_last_error": null,
+    "member_log_channel_id": 123456789,      // Channel in den der Webhook postet; null wenn disabled
+    "bot_trap_channel_id": null,             // Bot-Trap-Channel; null wenn disabled
+    "bot_trap_status": "disabled",           // "ok" | "disabled" | "error"
+    "bot_trap_last_error": null,
     "join_role_status": "ok",                // "ok" | "disabled" | "error", zuletzt beobachtete Rollenvergabe
     "join_role_last_error": null,
     "last_clear_count": 12,                  // letztes /clear-Kommando
@@ -179,10 +188,11 @@ diese Sektion. `counters`-Objekte liefern rollierende Zählungen der letzten
       "kicks": {"15m": 0, "1h": 0, "24h": 0},
       "timeouts": {"15m": 0, "1h": 0, "24h": 1},
       "unbans": {"15m": 0, "1h": 0, "24h": 0},
-      "honeypot_bans": {"15m": 0, "1h": 0, "24h": 0}
+      "honeypot_bans": {"15m": 0, "1h": 0, "24h": 0},
+      "bot_trap_bans": {"15m": 0, "1h": 0, "24h": 0}
     },
-    "events": [                              // rollierendes Log (max_len=300): join/leave/kick/ban/timeout/unban
-      {"at": "2026-07-08T22:10:03Z", "type": "ban", "user": "spammer#0001", "user_id": 123, "moderator": "admin#0001", "reason": "Spam", "guild": "Die Grünen"}
+    "events": [                              // rollierendes Log (max_len=300): join/leave/kick/ban/timeout/unban/bot_trap_ban/honeypot_ban
+      {"at": "2026-07-08T22:10:03Z", "type": "honeypot_ban", "user": "spammer#0001", "user_id": 123, "guild": "Die Grünen", "time_to_ban_ms": 178}
     ]
   },
 
@@ -228,6 +238,46 @@ diese Sektion. `counters`-Objekte liefern rollierende Zählungen der letzten
       {"at": "2026-07-01T06:00:04Z", "month": "2026-06", "sent_at": "2026-07-01T06:00:04Z"}
     ]
   }
+  "feedback": {
+    "updated_at": "2026-07-09T12:00:00Z",
+    "bot_avatar_url": "https://cdn.discordapp.com/avatars/1409734087966457886/…",  // Bot-eigener Avatar für Dashboard-Darstellung
+    "last_submission_at": "2026-07-09T11:58:00Z",  // zuletzt erfolgreich gespeichert, ISO 8601; fehlt vor erstem Submit
+    "last_error": null,                              // null | "DB not connected" | "DB insert failed"
+    "counters": {                                    // nur vorhanden nach erstem Ereignis
+      "submissions": {"15m": 3, "1h": 8, "24h": 25},
+      "submission_errors": {"15m": 0, "1h": 0, "24h": 1}
+    },
+    "guilds": [                              // per-guild aggregate counts mit Status-Breakdown
+      {
+        "guild_id": "1374489236215955506",   // Discord-Snowflake als String (JS-safe)
+        "guild_name": "Die Grünen",
+        "guild_avatar_url": "https://cdn.discordapp.com/icons/…",  // Guild-Icon; null wenn keins gesetzt
+        "total": 12,
+        "new": 3,
+        "important": 1,
+        "in_progress": 2,
+        "archived": 6
+      }
+    ],
+    "entries": [                             // letzte 20 Einsendungen, neueste zuerst
+      {
+        "id": 42,
+        "guild_id": 1374489236215955506,     // BIGINT als Zahl (PostgreSQL-native), nicht String
+        "guild_name": "Die Grünen",          // aus Discord-Cache angereichert
+        "guild_avatar_url": "https://cdn.discordapp.com/icons/…",
+        "user_id": 485051896655249419,       // 0 wenn is_anonymous == true
+        "user_name": "admin",                // Discord Display-Name; null wenn anonymous
+        "user_avatar_url": "https://cdn.discordapp.com/avatars/…",  // null wenn anonymous
+        "is_anonymous": false,
+        "subject": "moderation",             // "moderation" | "match_tracking" | "verein" | "other"
+        "message": "…",                      // auf 200 Zeichen gekürzt
+        "status": "new",                     // "new" | "important" | "in_progress" | "archived"
+        "read": false,
+        "admin_note": null,                  // interne Notiz vom Dashboard-Admin, null wenn keine
+        "created_at": "2026-07-09T12:00:00+00:00"
+      }
+    ]
+  }
 }
 ```
 
@@ -238,22 +288,72 @@ diese Sektion. `counters`-Objekte liefern rollierende Zählungen der letzten
 | Bot online/offline | `bot.gateway_status == "connected"` **und** `generated_at` nicht älter als ~2 Min |
 | E-Sports-Polling hängt | `esports.last_poll_at` älter als `2 × poll_interval_minutes` |
 | API-Ausfall (wie am 03.–05.07.) | `http.counters.timeouts["15m"]` oder `esports.counters.api_errors["15m"]` > 0 über mehrere Snapshots hinweg |
+| Feedback-Feature kaputt | `feedback.last_error` gesetzt oder `feedback.counters.submission_errors["1h"]` > 0 |
 | Geburtstags-Feature kaputt | `birthday.sheets_connected == false` oder `birthday.last_check_result == "error"` |
 | CS-Tracking aktiv | `esports.active_cs_trackers > 0`, Details in `esports.cs_trackers[]` |
 | Reconnect-Häufung | `bot.counters.reconnects["1h"]` > 2–3 |
 | Kassenbuch-Feature kaputt | `finance.sheets_connected == false` oder `finance.last_error` gesetzt |
 | Monatsreport verpasst | `finance.last_report_month` entspricht nicht dem Vormonat, obwohl der 1. bereits vergangen ist |
+| Ungelesenes Feedback | `feedback.guilds[].new > 0` — zeigt an, in welchen Guilds neue Einsendungen warten |
+
+
+## Feedback API
+
+Für schreibende Zugriffe (Status ändern, als gelesen markieren, Admin-Notizen
+setzen) läuft im Bot-Prozess ein leichtgewichtiger aiohttp-HTTP-Server auf
+Port **8080** (implementiert in [`core/api_server.py`](core/api_server.py)).
+Er teilt sich den asyncio-Event-Loop mit dem Discord-Client.
+
+### Endpunkte
+
+| Methode | Pfad | Query/Body | Antwort |
+|---|---|---|---|
+| `GET` | `/api/feedback` | `?guild_id=X` (optional) | `[{id, guild_id, guild_name, guild_avatar_url, user_id, user_name, user_avatar_url, is_anonymous, subject, message, status, read, admin_note, created_at}]` |
+| `GET` | `/api/feedback/unread-count` | `?guild_id=X` (required) | `{"count": 3}` |
+| `PATCH` | `/api/feedback/{id}/read` | — | `{"ok": true}` |
+| `PATCH` | `/api/feedback/{id}/status` | Query `?status=X` oder Body `{"status": "X"}` | `{"ok": true}` |
+| `PATCH` | `/api/feedback/{id}/note` | Body `{"note": "…"}` | `{"ok": true}` |
+| `GET` | `/api/bot/avatar` | — | `{"bot_avatar_url": "…"}` |
+
+Alle Antworten sind `application/json`. Fehler liefern HTTP 400/500/503 mit
+`{"error": "…"}` oder `{"ok": false, "error": "…"}`.
+
+**Status-Werte:** `new` | `important` | `in_progress` | `archived`
+
+### Netzwerk-Integration für `~/dashboard/`
+
+Der Bot-Container ist Mitglied des `dashboard-network` (externes Netzwerk in
+`docker-compose.yml`). Das Dashboard kann die API unter
+`http://roaringbot:8080` erreichen, sobald es ebenfalls diesem Netzwerk
+beitritt:
+
+```yaml
+# dashboard/docker-compose.yml — hinzufügen:
+networks:
+  - roaringbot-network   # external: true (wird von RoaringBot verwaltet)
+```
+
+Empfohlene Proxy-Endpoints im Dashboard (`dashboard/app/main.py`):
+
+| Dashboard-Route | Proxy-Ziel |
+|---|---|
+| `GET /api/roaringbot/feedback/list?guild_id=X` | `GET http://roaringbot:8080/api/feedback?guild_id=X` |
+| `GET /api/roaringbot/feedback/unread-count?guild_id=X` | `GET http://roaringbot:8080/api/feedback/unread-count?guild_id=X` |
+| `PATCH /api/roaringbot/feedback/{id}/read` | `PATCH http://roaringbot:8080/api/feedback/{id}/read` |
+| `PATCH /api/roaringbot/feedback/{id}/status?status=X` | `PATCH http://roaringbot:8080/api/feedback/{id}/status?status=X` |
+| `PATCH /api/roaringbot/feedback/{id}/note` | `PATCH http://roaringbot:8080/api/feedback/{id}/note` |
+
+Die Proxy-Endpoints sind analog zu den bestehenden Tausendsassa-Feedback-Routen
+(`/api/tausendsassa/feedback/…`) aufgebaut.
 
 ## Konsum durch das Dashboard
 
-- Volume-Mount: `dashboard/docker-compose.yml` → `/root/roaringbot/data:/data/roaringbot:ro`
-- Reader: `dashboard/app/roaringbot_status.py` (`get_status()`), prüft
-  Existenz, Parsing-Fehler und Alter der Datei (`stale`-Flag, Schwelle 120s).
-- Endpoint: `GET /api/roaringbot/status` in `dashboard/app/main.py`.
-- Antwort bei fehlender/kaputter Datei: `{"available": false, "reason": "..."}`
-  statt eines Fehlers — das Frontend kann so unterscheiden zwischen
-  "Bot nie gestartet"/"Volume nicht gemountet" und "Bot läuft, aber Feature X
-  noch nie ausgelöst".
+- **Status (read-only):** Volume-Mount `./data:/data/roaringbot:ro` →
+  `dashboard/app/roaringbot_status.py` → `GET /api/roaringbot/status`.
+  Prüft Existenz, Parsing-Fehler und Alter (`stale`-Flag, Schwelle 120s).
+- **Feedback (read/write):** REST-API auf Port 8080 im Bot-Container.
+  Dashboard proxyed die Endpunkte (siehe [Feedback API](#feedback-api)).
+- Antwort bei fehlender/kaputter Datei: `{"available": false, "reason": "…"}` statt eines Fehlers — das Frontend kann so unterscheiden zwischen "Bot nie gestartet" / "Volume nicht gemountet" und "Bot läuft, aber Feature X noch nie ausgelöst".
 
 ## Erweitern
 
@@ -262,3 +362,11 @@ Neue Signale hinzufügen: im jeweiligen Cog/Modul
 relevanten Stelle `status_reporter.record(...)` bzw. `.bump_counter(...)`
 aufrufen — keine Änderung an `status_reporter.py` selbst nötig. Neue
 Sektionen erscheinen automatisch im nächsten Snapshot.
+
+Der `feedback`-Abschnitt kombiniert zwei Datenquellen:
+- **Event-getrieben** (`cogs/feedback.py`): `last_submission_at`, `last_error`,
+  `counters.submissions` / `counters.submission_errors` — bei jedem Submit.
+- **Periodisch** (`bot.py:_feedback_stats_loop`, alle 60s): `guilds[]`
+  (Aggregat-Counts), `entries[]` (letzte 20), `bot_avatar_url`. Guild-Namen,
+  Avatare und User-Infos werden aus dem Discord-Cache (`bot.guilds`,
+  `bot.get_user()`) angereichert.

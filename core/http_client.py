@@ -33,7 +33,12 @@ class HTTPClientManager:
             limit_per_host=config.max_connections_per_host,  # Per-host limit
             ttl_dns_cache=300,  # DNS cache TTL (5 minutes)
             use_dns_cache=True,  # Enable DNS caching
-            keepalive_timeout=30,  # Keep connections alive for 30 seconds
+            # Must stay clearly below the shortest poll interval (30 s
+            # livescore loop): with 30 s the pooled connection was idle for
+            # exactly one keep-alive window between polls, the server had
+            # already closed it, and every first attempt hit a dead socket
+            # (15 s read timeout before the retry succeeded instantly).
+            keepalive_timeout=15,
             enable_cleanup_closed=True,  # Clean up closed connections
             force_close=False,  # Reuse connections when possible
         )

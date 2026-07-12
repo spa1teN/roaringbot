@@ -13,8 +13,10 @@ from db.repositories.base import BaseRepository
 
 _KEY_TO_COLUMN = {
     "member_log_webhook": "member_log_webhook",
+    "member_log_channel": "member_log_channel_id",
     "join_role": "join_role_id",
     "honeypot_role": "honeypot_role_id",
+    "bot_trap_channel": "bot_trap_channel_id",
 }
 
 
@@ -24,7 +26,8 @@ class ModerationRepository(BaseRepository):
     async def get_guild_config(self, guild_id: int) -> Dict[str, Any]:
         """Get moderation config for a guild as a dict (compatibility shape)."""
         row = await self.fetchrow(
-            "SELECT member_log_webhook, join_role_id, honeypot_role_id "
+            "SELECT member_log_webhook, member_log_channel_id, join_role_id, "
+            "honeypot_role_id, bot_trap_channel_id "
             "FROM moderation_config WHERE guild_id = $1",
             guild_id
         )
@@ -32,8 +35,10 @@ class ModerationRepository(BaseRepository):
             return {}
         return {
             "member_log_webhook": row["member_log_webhook"],
+            "member_log_channel": row["member_log_channel_id"],
             "join_role": row["join_role_id"],
             "honeypot_role": row["honeypot_role_id"],
+            "bot_trap_channel": row["bot_trap_channel_id"],
         }
 
     async def set_guild_config(self, guild_id: int, key: str, value: Any) -> None:
@@ -70,13 +75,16 @@ class ModerationRepository(BaseRepository):
     async def get_all_configs(self) -> Dict[int, Dict[str, Any]]:
         """Get all moderation configs as a dict (for the migration script)."""
         rows = await self.fetch(
-            "SELECT guild_id, member_log_webhook, join_role_id, honeypot_role_id FROM moderation_config"
+            "SELECT guild_id, member_log_webhook, member_log_channel_id, "
+            "join_role_id, honeypot_role_id, bot_trap_channel_id FROM moderation_config"
         )
         return {
             row["guild_id"]: {
                 "member_log_webhook": row["member_log_webhook"],
+                "member_log_channel": row["member_log_channel_id"],
                 "join_role": row["join_role_id"],
                 "honeypot_role": row["honeypot_role_id"],
+                "bot_trap_channel": row["bot_trap_channel_id"],
             }
             for row in rows
         }

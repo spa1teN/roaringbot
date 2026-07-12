@@ -99,7 +99,18 @@ class FinanceCog(commands.Cog):
         return await asyncio.get_event_loop().run_in_executor(None, self._fetch_entries_sync)
 
     # ─── Report building (same logic as BearsFinanz/script.py) ────────────────
+    MONTH_NAMES = ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli",
+                   "August", "September", "Oktober", "November", "Dezember"]
+
+    @staticmethod
+    def _fmt_eur(amount: Decimal) -> str:
+        """German currency format with explicit sign: '+1.191,69 €'."""
+        s = f"{amount:+,.2f}"
+        return s.replace(",", "|").replace(".", ",").replace("|", ".") + " €"
+
     def _build_month_report(self, entries: List[dict], start_prev, end_prev) -> tuple:
+        """CV2 monthly report: heading, one -# line per transaction, saldo
+        summary with the monthly balance, sheet link button."""
         before = [e for e in entries if e["date"] < start_prev]
         saldo_start = sorted(before, key=lambda e: e["date"])[-1]["saldo"] if before else "–"
 
@@ -111,27 +122,38 @@ class FinanceCog(commands.Cog):
         for e in month_tx:
             amt = _signed_amount(e)
             bilanz += amt
-            amt_str = f"{amt:+.2f} €"
-            lines.append(f"-# - {e['date']:%d.%m}: **{amt_str}**, {e['cat']} ({e['note']})")
+            line = f"-# `{e['date']:%d.%m.}` **{self._fmt_eur(amt)}** · {e['cat']}"
+            if e["note"]:
+                line += f" — {e['note']}"
+            lines.append(line)
 
-        embed = discord.Embed(
-            title=f"Kassenbuch-Report {start_prev:%B %Y}",
-            description="**Transaktionen:**\n" + ("\n".join(lines) if lines else "_Keine Buchungen_"),
-            color=0xFFD400,
+        month_name = self.MONTH_NAMES[start_prev.month - 1]
+        n = len(month_tx)
+        header = (
+            f"## Kassenbericht {month_name} {start_prev.year}\n"
+            f"-# {n} Buchung{'en' if n != 1 else ''} · {start_prev:%d.%m.}–{end_prev:%d.%m.}"
         )
-        embed.add_field(name=f"Anfangssaldo ({start_prev:%d.%m}):", value=f"{saldo_start}", inline=True)
-        embed.add_field(name=f"Endsaldo ({end_prev:%d.%m}):", value=f"{saldo_end}", inline=True)
-        embed.add_field(name="Monatsbilanz:", value=f"{bilanz} €", inline=False)
-        return embed, bilanz
 
-    def _sheet_link_view(self) -> discord.ui.View:
-        view = discord.ui.View()
-        view.add_item(discord.ui.Button(
+        container = discord.ui.Container(accent_colour=discord.Colour(0xFFD400))
+        container.add_item(discord.ui.TextDisplay(header))
+        container.add_item(discord.ui.Separator())
+        container.add_item(discord.ui.TextDisplay("\n".join(lines) if lines else "_Keine Buchungen_"))
+        container.add_item(discord.ui.Separator())
+        container.add_item(discord.ui.TextDisplay(
+            f"Anfangssaldo `{saldo_start}` → Endsaldo `{saldo_end}`\n"
+            f"### Monatsbilanz: {self._fmt_eur(bilanz)}"
+        ))
+        row = discord.ui.ActionRow()
+        row.add_item(discord.ui.Button(
             label="Zum Kassenbuch",
             style=discord.ButtonStyle.link,
             url=f"https://docs.google.com/spreadsheets/d/{config.kassenbuch_spreadsheet_id}/edit?usp=sharing",
         ))
-        return view
+        container.add_item(row)
+
+        view = discord.ui.LayoutView(timeout=None)
+        view.add_item(container)
+        return view, bilanz
 
     # ─── Monthly report (replaces the external cron job) ───────────────────────
     @tasks.loop(time=time(hour=6, minute=0))  # UTC; fires daily, only acts on the 1st
@@ -160,8 +182,8 @@ class FinanceCog(commands.Cog):
         end_prev = today - timedelta(days=1)
         start_prev = end_prev.replace(day=1)
 
-        embed, bilanz = self._build_month_report(entries, start_prev, end_prev)
-        await channel.send(embed=embed, view=self._sheet_link_view())
+        view, bilanz = self._build_month_report(entries, start_prev, end_prev)
+        await channel.send(view=view)
         self.log.info(f"Sent Kassenbuch monthly report for {start_prev:%B %Y}")
         report_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         report_month = start_prev.strftime("%Y-%m")
