@@ -26,6 +26,7 @@ class EsportsRepository(BaseRepository):
         known_rows = await self.fetch("SELECT match_id, monitored FROM esports_known_matches")
         tracker_rows = await self.fetch("SELECT * FROM cs_trackers")
         summary_row = await self.fetchrow("SELECT value FROM esports_state WHERE key = 'summary_message_id'")
+        finished_row = await self.fetchrow("SELECT value FROM esports_state WHERE key = 'livescore_finished_ids'")
 
         return {
             "event_to_match": {r["event_id"]: r["match_id"] for r in event_rows},
@@ -34,6 +35,7 @@ class EsportsRepository(BaseRepository):
             "summary_message_id": (json.loads(summary_row["value"]) if summary_row else None),
             "monitored_matches": [r["match_id"] for r in known_rows if r["monitored"]],
             "known_match_ids": [r["match_id"] for r in known_rows],
+            "livescore_finished_ids": (json.loads(finished_row["value"]) if finished_row else []),
             "active_cs_trackers": {
                 str(r["match_id"]): {
                     "message_id": r["message_id"],
@@ -58,6 +60,7 @@ class EsportsRepository(BaseRepository):
         monitored_matches: Set[int],
         known_match_ids: Set[int],
         active_cs_trackers: Dict[int, dict],
+        livescore_finished_ids: Set[int] = None,
     ) -> None:
         """Bulk-resync all E-Sports state (full replace, matches the old
         write-everything-at-once JSON semantics)."""
@@ -88,6 +91,12 @@ class EsportsRepository(BaseRepository):
                     """INSERT INTO esports_state (key, value) VALUES ('summary_message_id', $1)
                        ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""",
                     json.dumps(summary_message_id),
+                )
+
+                await conn.execute(
+                    """INSERT INTO esports_state (key, value) VALUES ('livescore_finished_ids', $1)
+                       ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""",
+                    json.dumps(list(livescore_finished_ids) if livescore_finished_ids else []),
                 )
 
                 await conn.execute("DELETE FROM esports_known_matches")

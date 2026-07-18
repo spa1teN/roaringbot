@@ -268,6 +268,38 @@ EVENT_COVER_PAD = 40
 EVENT_COVER_SCALE = 0.7   # logos at 70 % of their box-fit size
 EVENT_COVER_SHIFT = 0.25  # fraction of half-width to shift each logo inward
 
+TBA_SIZE = 512  # square placeholder matching a typical logo resolution
+
+
+def _make_tba_placeholder() -> bytes:
+    """Generate a square dark placeholder with 'TBA' in white sans-serif text.
+    Returned as PNG bytes so it slots into the existing compose pipeline as if
+    it were a fetched opponent logo."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    img = Image.new("RGBA", (TBA_SIZE, TBA_SIZE), (24, 24, 27, 255))
+    draw = ImageDraw.Draw(img)
+
+    text = "TBA"
+    # Try a system font; fall back to the tiny PIL default if unavailable
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size=100)
+    except (OSError, IOError):
+        font = ImageFont.load_default()
+
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    draw.text(
+        ((TBA_SIZE - tw) // 2, (TBA_SIZE - th) // 2 - bbox[1]),
+        text,
+        fill=(180, 180, 180, 255),
+        font=font,
+    )
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
 
 def compose_versus_image(opponent_png: bytes) -> bytes:
     """Composite the club logo (left half) and the opponent logo (right half)
@@ -736,6 +768,7 @@ class EsportsCog(commands.Cog):
         self.active_cs_games: Dict[int, CSGameTracker] = {}  # match ID -> tracker
         self.monitored_matches: Set[int] = set()  # Matches currently being monitored for start time
         self._pending_tracker_restore: Dict[int, dict] = {}  # Loaded from DB, applied after first API poll
+        self._livescore_finished_ids: Set[int] = set()  # Match IDs finished via livescore sync; skip health checks until they leave the API
 
         # German timezone for weekly summary scheduling
         self.germany_tz = pytz.timezone("Europe/Berlin")
@@ -760,6 +793,7 @@ class EsportsCog(commands.Cog):
             self.summary_message_id = data["summary_message_id"]
             self.monitored_matches = set(data["monitored_matches"])
             self.known_match_ids = set(data["known_match_ids"])
+            self._livescore_finished_ids = set(data.get("livescore_finished_ids", []))
             self._pending_tracker_restore = {
                 int(k): v for k, v in data["active_cs_trackers"].items()
             }
@@ -796,6 +830,7 @@ class EsportsCog(commands.Cog):
                 monitored_matches=self.monitored_matches,
                 known_match_ids=set(self.matches.keys()),
                 active_cs_trackers=active_cs_trackers,
+                livescore_finished_ids=self._livescore_finished_ids,
             )
         except Exception as e:
             self.log.error(f"Error saving esports data: {e}")
@@ -1228,8 +1263,12 @@ class EsportsCog(commands.Cog):
                                 # End the Discord event
                                 await self._end_match_event(tracker.match)
 
-                                # Remove from active games
+                                # Remove from active games and silence health checks
+                                # until the match leaves the API (the event and
+                                # tracker are already gone, so "no_discord_event"
+                                # and "tracking_missing" would fire every poll).
                                 del self.active_cs_games[match_id]
+                                self._livescore_finished_ids.add(match_id)
                             else:
                                 await message.edit(view=ScoreUpdateView(tracker, self))
                     except discord.NotFound:
@@ -1390,6 +1429,10 @@ class EsportsCog(commands.Cog):
         )
 
     EVENT_START_LEAD = timedelta(minutes=5)
+    # Start the event 60 seconds before its scheduled_start_time so our bot
+    # deterministically beats Discord's built-in auto-start; otherwise they
+    # race and Discord wins when the poll lands a few seconds past the hour.
+    EVENT_START_PRE_LEAD = timedelta(seconds=60)
 
     def _event_target_start(self, match: "EsportsMatch") -> datetime:
         """The Discord event should go live 5 minutes before the real kickoff.
@@ -1398,6 +1441,13 @@ class EsportsCog(commands.Cog):
         (target <= now) can never become true.
         """
         return match.start_time - self.EVENT_START_LEAD
+
+    def _event_start_trigger(self, match: "EsportsMatch") -> datetime:
+        """The instant at which our code should try to start the event.
+        This is 60 seconds before the nominal target (and therefore 60 seconds
+        before the event's visible scheduled_start_time on Discord), so we
+        always beat Discord's own auto-start."""
+        return self._event_target_start(match) - self.EVENT_START_PRE_LEAD
 
     def _event_api_start_time(self, match: "EsportsMatch") -> datetime:
         """The start_time to send to Discord when creating/editing an event:
@@ -1459,6 +1509,12 @@ class EsportsCog(commands.Cog):
         dashboard's E-Sports status boxes so problems aren't silent."""
         issues = []
 
+        # Matches already finished by the livescore sync have their
+        # event/tracker cleaned up — skip them until they leave the API
+        # (at which point _handle_match_finished removes them from the set).
+        if match.id in self._livescore_finished_ids:
+            return issues
+
         if not match.discord_event_id:
             issues.append("no_discord_event")
 
@@ -1467,7 +1523,7 @@ class EsportsCog(commands.Cog):
         if time_to_start <= 1800 and not reminder_ok:
             issues.append("reminder_missing")
 
-        if match.discord_event_id and now >= self._event_target_start(match):
+        if match.discord_event_id and now >= self._event_start_trigger(match):
             status = self._event_status_by_match.get(match.id)
             if status == discord.EventStatus.scheduled:
                 issues.append("event_not_started")
@@ -1485,7 +1541,9 @@ class EsportsCog(commands.Cog):
         """Build the dashboard's next-3-matches status list, see DATA_INTERFACE.md."""
         result = []
         for m in matches:
-            is_live = m.start_time <= now and (m.end_time is None or m.end_time >= now)
+            is_live = (m.start_time <= now
+                       and (m.end_time is None or m.end_time >= now)
+                       and m.id not in self._livescore_finished_ids)
             issues = self._match_health_issues(m, now)
 
             reminder_at = m.start_time - timedelta(minutes=30)
@@ -1501,7 +1559,7 @@ class EsportsCog(commands.Cog):
                 tracking_at = m.start_time - timedelta(minutes=5)
                 tracking_ok = m.id in self.active_cs_games or (
                     m.end_time is not None and now >= m.end_time
-                )
+                ) or m.id in self._livescore_finished_ids
 
             live_score = None
             if m.game == "cs" and m.id in self.active_cs_games:
@@ -1521,7 +1579,8 @@ class EsportsCog(commands.Cog):
                 "start_time": m.start_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "detail_url": m.detail_url,
                 "is_live": is_live,
-                "has_discord_event": bool(m.discord_event_id),
+                "cleanly_finished": m.id in self._livescore_finished_ids,
+                "has_discord_event": bool(m.discord_event_id or m.id in self._livescore_finished_ids),
                 "reminder_at": reminder_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "reminder_ok": reminder_ok,
                 "tracking_at": tracking_at.strftime("%Y-%m-%dT%H:%M:%SZ") if tracking_at else None,
@@ -1572,7 +1631,7 @@ class EsportsCog(commands.Cog):
             # time stays relative to the real kickoff (see _event_end_time).
             event_start_time = self._event_api_start_time(match)
             end_time = self._event_end_time(match)
-            versus_bytes = await self._build_event_cover_media(match)
+            event_cover_bytes = await self._build_event_cover_media(match)
 
             # Determine voice channel and entity type
             voice_channel = None
@@ -1591,7 +1650,6 @@ class EsportsCog(commands.Cog):
                     entity_type = discord.EntityType.voice
                     location = None
 
-            versus_bytes = await self._build_reminder_media(match)
             # Create the event
             if entity_type == discord.EntityType.voice and voice_channel:
                 event = await guild.create_scheduled_event(
@@ -1602,7 +1660,7 @@ class EsportsCog(commands.Cog):
                     entity_type=entity_type,
                     channel=voice_channel,
                     privacy_level=discord.PrivacyLevel.guild_only,
-                    image=versus_bytes
+                    **({"image": event_cover_bytes} if event_cover_bytes is not None else {})
                 )
             else:
                 event = await guild.create_scheduled_event(
@@ -1613,7 +1671,7 @@ class EsportsCog(commands.Cog):
                     entity_type=discord.EntityType.external,
                     location="wannspieltbig.de",
                     privacy_level=discord.PrivacyLevel.guild_only,
-                    image=versus_bytes
+                    **({"image": event_cover_bytes} if event_cover_bytes is not None else {})
                 )
             
             # Store the mapping
@@ -1695,6 +1753,9 @@ class EsportsCog(commands.Cog):
                     entity_type = discord.EntityType.voice
                     location = None
 
+            # Refresh cover image (e.g. TBA → real opponent logo)
+            event_cover_bytes = await self._build_event_cover_media(match)
+
             # Only update start_time if event is still scheduled (not active/completed)
             # Discord API error 50035 occurs when trying to update start_time of non-scheduled event
             now = datetime.now(timezone.utc)
@@ -1721,6 +1782,7 @@ class EsportsCog(commands.Cog):
                 return
 
             # Update the event
+            cover_kwargs = {"image": event_cover_bytes} if event_cover_bytes is not None else {}
             if entity_type == discord.EntityType.voice and voice_channel:
                 if can_update_start_time:
                     await event.edit(
@@ -1729,14 +1791,16 @@ class EsportsCog(commands.Cog):
                         start_time=event_start_time,
                         end_time=end_time,
                         entity_type=entity_type,
-                        channel=voice_channel
+                        channel=voice_channel,
+                        **cover_kwargs
                     )
                 else:
                     # Event already started - only update what Discord allows
                     await event.edit(
                         name=match.event_name,
                         description=match.event_description,
-                        end_time=end_time
+                        end_time=end_time,
+                        **cover_kwargs
                     )
             else:
                 if can_update_start_time:
@@ -1746,14 +1810,16 @@ class EsportsCog(commands.Cog):
                         start_time=event_start_time,
                         end_time=end_time,
                         entity_type=discord.EntityType.external,
-                        location="wannspieltbig.de"
+                        location="wannspieltbig.de",
+                        **cover_kwargs
                     )
                 else:
                     # Event already started - only update what Discord allows
                     await event.edit(
                         name=match.event_name,
                         description=match.event_description,
-                        end_time=end_time
+                        end_time=end_time,
+                        **cover_kwargs
                     )
 
             self.log.info(f"Updated Discord event {event.id} for match {match.id}")
@@ -1871,6 +1937,9 @@ class EsportsCog(commands.Cog):
             # Remove from monitored matches
             if match.id in self.monitored_matches:
                 self.monitored_matches.remove(match.id)
+
+            # Remove from livescore-finished set (safe no-op if not present)
+            self._livescore_finished_ids.discard(match.id)
             
         except Exception as e:
             self.log.error(f"Error handling finished match {match.id}: {e}")
@@ -2158,6 +2227,70 @@ class EsportsCog(commands.Cog):
                     self.monitored_matches.add(match.id)
                     await self._start_cs_game_tracking(match)
     
+    # Sentinel returned by _find_alternative_vc when both VCs are occupied.
+    _VC_BLOCKED = object()
+
+    async def _find_alternative_vc(
+        self, guild: discord.Guild, current_channel_id: int, match: "EsportsMatch"
+    ):
+        """Check whether *current_channel_id* already has an active voice event.
+
+        Returns
+        -------
+        (None, None)
+            The current channel is free — no action needed.
+        (discord.VoiceChannel, str)
+            The current channel is occupied, but the *other* configured VC is
+            free.  The tuple contains the channel object and its label
+            (``"VC 1"`` / ``"VC 2"``) for updating ``block_voice_channel``.
+        (_VC_BLOCKED, None)
+            Both voice channels are occupied.  The caller should skip this
+            cycle and retry on the next poll.
+        """
+        # Build the set of voice-channel IDs that currently have an active event.
+        try:
+            all_events = await guild.fetch_scheduled_events()
+        except Exception as exc:
+            self.log.warning(
+                f"Could not fetch guild events for VC availability check: {exc}"
+            )
+            return (None, None)  # can't tell — let event.start() decide
+
+        active_channel_ids = {
+            e.channel_id
+            for e in all_events
+            if e.status == discord.EventStatus.active
+            and e.entity_type == discord.EntityType.voice
+            and e.channel_id is not None
+        }
+
+        if current_channel_id not in active_channel_ids:
+            return (None, None)  # current VC is free
+
+        # Current VC is occupied — see if the other one is free.
+        vc1_id = config.esports_vc1_id
+        vc2_id = config.esports_vc2_id
+        if current_channel_id == vc1_id:
+            other_id, other_label = vc2_id, "VC 2"
+        elif current_channel_id == vc2_id:
+            other_id, other_label = vc1_id, "VC 1"
+        else:
+            # The event is on a VC that isn't one of our two configured ones.
+            self.log.warning(
+                f"Event for match {match.id} is on unknown VC {current_channel_id}"
+            )
+            return (None, None)
+
+        if other_id is None or other_id in active_channel_ids:
+            return (self._VC_BLOCKED, None)
+
+        other_channel = guild.get_channel(other_id)
+        if other_channel is None or not isinstance(other_channel, discord.VoiceChannel):
+            self.log.warning(f"Configured {other_label} ({other_id}) is not a voice channel")
+            return (self._VC_BLOCKED, None)
+
+        return (other_channel, other_label)
+
     async def _check_event_status_updates(self):
         """Check for Discord events that need status updates (start/end)"""
         now = datetime.now(timezone.utc)
@@ -2179,8 +2312,11 @@ class EsportsCog(commands.Cog):
                         event = await guild.fetch_scheduled_event(event_id)
                     except discord.NotFound:
                         pass
-                    except Exception:
-                        pass
+                    except Exception as fetch_exc:
+                        self.log.warning(
+                            f"Could not fetch event {event_id} for match {match_id}: "
+                            f"{type(fetch_exc).__name__}: {fetch_exc}"
+                        )
             else:
                 # Search through all guilds (original behavior)
                 for g in self.bot.guilds:
@@ -2190,7 +2326,11 @@ class EsportsCog(commands.Cog):
                         break
                     except discord.NotFound:
                         continue
-                    except Exception:
+                    except Exception as fetch_exc:
+                        self.log.warning(
+                            f"Could not fetch event {event_id} from guild {g.id}: "
+                            f"{type(fetch_exc).__name__}: {fetch_exc}"
+                        )
                         continue
             
             if not event:
@@ -2234,9 +2374,34 @@ class EsportsCog(commands.Cog):
                 await self._create_discord_event(match)
                 continue
 
-            # Check if event should be started (5 minutes before real kickoff)
+            # Check if event should be started (60 s before its scheduled_start_time
+            # to deterministically beat Discord's built-in auto-start — see
+            # EVENT_START_PRE_LEAD).
             if (event.status == discord.EventStatus.scheduled and
-                    self._event_target_start(match) <= now):
+                    self._event_start_trigger(match) <= now):
+
+                # If this is a voice event, Discord only allows one active event
+                # per voice channel.  Check availability before calling start()
+                # so we don't burn failure attempts on a predictable conflict.
+                if event.entity_type == discord.EntityType.voice and event.channel_id:
+                    alt_ch, alt_label = await self._find_alternative_vc(
+                        guild, event.channel_id, match
+                    )
+                    if alt_ch is self._VC_BLOCKED:
+                        self.log.warning(
+                            f"Cannot start event {event_id} for match {match_id} "
+                            f"({match.event_name}): voice channel occupied and "
+                            f"other VC also busy — will retry next poll"
+                        )
+                        continue
+                    if alt_ch is not None:
+                        self.log.info(
+                            f"Switching event {event_id} for match {match_id} "
+                            f"({match.event_name}) to {alt_label} (current VC occupied)"
+                        )
+                        await event.edit(channel=alt_ch)
+                        match.block_voice_channel = alt_label
+
                 try:
                     await event.start()
                     self.log.info(f"Started Discord event {event_id} for match {match_id}: {match.event_name}")
@@ -2341,11 +2506,15 @@ class EsportsCog(commands.Cog):
 
     async def _build_reminder_media(self, match: EsportsMatch) -> Optional[bytes]:
         """The composed 2:1 versus image for the reminder, or None when it
-        can't be built (no opponent logo / proxy failure) — the caller then
-        falls back to the plain gallery. The opponent logo is fetched through
-        the images.weserv.nl proxy because HLTV's CDN blocks server IPs;
-        results are cached per match so reschedule edits don't re-fetch."""
+        can't be built (proxy failure for a known logo). A TBA placeholder is
+        generated when the opponent hasn't been announced yet, so the event is
+        created immediately and the cover is replaced once the real logo
+        arrives. The opponent logo is fetched through the images.weserv.nl
+        proxy because HLTV's CDN blocks server IPs; results are cached per
+        match so reschedule edits don't re-fetch."""
         if not match.team_b_logo_url:
+            if match.team_b == "TBA":
+                return await asyncio.to_thread(compose_versus_image, _make_tba_placeholder())
             return None
         cached = self._versus_cache.get(match.id)
         if cached and cached[0] == match.team_b_logo_url:
@@ -2374,10 +2543,12 @@ class EsportsCog(commands.Cog):
     async def _build_event_cover_media(self, match: EsportsMatch) -> Optional[bytes]:
         """4:1 variant of the versus image for the Discord event cover.
         Same opponent-logo fetch + proxy as _build_reminder_media but uses
-        the event-cover composition (smaller logos, pulled closer)."""
+        the event-cover composition (smaller logos, pulled closer). A TBA
+        placeholder is generated when the opponent isn't announced yet."""
         if not match.team_b_logo_url:
+            if match.team_b == "TBA":
+                return await asyncio.to_thread(compose_event_cover_image, _make_tba_placeholder())
             return None
-        import asyncio
         try:
             proxy_url = (
                 "https://images.weserv.nl/?url="

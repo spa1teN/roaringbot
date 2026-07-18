@@ -91,7 +91,8 @@ class BirthdayCog(commands.Cog):
         except Exception as e:
             self.log.error(f"Failed to read birthday spreadsheet: {e}")
             status_reporter.record(
-                "birthday", last_check_at=_now_iso(), last_check_result="error", last_error=str(e)
+                "birthday", last_check_at=_now_iso(), last_check_result="error",
+                last_error=str(e), sheets_connected=False,
             )
             return
 
