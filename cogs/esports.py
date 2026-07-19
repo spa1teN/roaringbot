@@ -1053,12 +1053,12 @@ class EsportsCog(commands.Cog):
                 (m for m in self.matches.values() if _is_current_or_upcoming(m, week_end)),
                 key=lambda m: m.start_time,
             )
-            # The dashboard's next-matches strip is NOT week-capped: always the
-            # next three live/upcoming matches, however far out they are.
-            next_three = sorted(
+            # All live/upcoming matches, sorted by start time — the dashboard
+            # renders the full list with no trimming.
+            all_upcoming = sorted(
                 (m for m in self.matches.values() if _is_current_or_upcoming(m)),
                 key=lambda m: m.start_time,
-            )[:3]
+            )
 
             status_reporter.record(
                 "esports",
@@ -1086,7 +1086,7 @@ class EsportsCog(commands.Cog):
                     }
                     for m in upcoming
                 ],
-                next_matches=self._compute_next_matches(next_three, now),
+                next_matches=self._compute_next_matches(all_upcoming, now),
             )
 
         except Exception as e:
@@ -1538,7 +1538,7 @@ class EsportsCog(commands.Cog):
         return issues
 
     def _compute_next_matches(self, matches: List["EsportsMatch"], now: datetime) -> list:
-        """Build the dashboard's next-3-matches status list, see DATA_INTERFACE.md."""
+        """Build the dashboard's live/upcoming matches status list, see DATA_INTERFACE.md."""
         result = []
         for m in matches:
             is_live = (m.start_time <= now

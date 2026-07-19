@@ -132,7 +132,7 @@ diese Sektion. `counters`-Objekte liefern rollierende Zählungen der letzten
         "is_finished": false
       }
     ],
-    "next_matches": [                        // die 3 nächsten Matches (live oder anstehend), mit Health-Check
+    "next_matches": [                        // alle anstehenden/laufenden Matches, mit Health-Check
       {
         "match_id": 2314,
         "teams": "BIG vs. TeamOrangeGaming",
