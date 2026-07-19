@@ -2502,7 +2502,7 @@ class EsportsCog(commands.Cog):
                 if 1740 <= time_to_start <= 1800:  # 29-30 minutes
                     await self._send_match_reminder(match, channel)
     
-    REMINDER_PING_DELAY = 30  # seconds between reminder message and role ping
+    REMINDER_PING_DELAY = 60  # seconds between reminder message and role ping
 
     async def _build_reminder_media(self, match: EsportsMatch) -> Optional[bytes]:
         """The composed 2:1 versus image for the reminder, or None when it
@@ -2584,7 +2584,10 @@ class EsportsCog(commands.Cog):
         thread before pinging."""
         try:
             await asyncio.sleep(self.REMINDER_PING_DELAY)
-            await thread.send(content=mention_text)
+            await thread.send(
+                content=mention_text,
+                allowed_mentions=discord.AllowedMentions(roles=True),
+            )
         except Exception as e:
             self.log.error(f"Failed to send delayed reminder ping for match {match_id}: {e}")
 
