@@ -1595,16 +1595,11 @@ class EsportsCog(commands.Cog):
     async def _create_discord_event(self, match: EsportsMatch):
         """Create a Discord scheduled event for a match"""
         try:
-            # Skip if event already exists
+            # Skip if event already tracked
             if match.discord_event_id:
                 self.log.debug(f"Discord event already exists for match {match.id}: {match.discord_event_id}")
                 return
-                
-            # Only create events for matches that haven't started yet
-            if match.start_time <= datetime.now(timezone.utc):
-                self.log.debug(f"Skipping event creation for past match {match.id}")
-                return
-            
+
             # Find a guild to create the event in
             guild = None
             if config.esports_guild_id:
@@ -1622,13 +1617,38 @@ class EsportsCog(commands.Cog):
                     if g.me.guild_permissions.manage_events:
                         guild = g
                         break
-            
+
             if not guild:
                 self.log.error("No guild found with manage events permission")
                 return
-            
-            # Event should go live 5 minutes before the real kickoff; the end
-            # time stays relative to the real kickoff (see _event_end_time).
+
+            # Before creating a new event, scan existing guild events for one
+            # with the same name.  If found, adopt it — this heals duplicates
+            # created by transient NotFound in _update_discord_event or
+            # _check_event_status_updates, and prevents the problem from
+            # compounding across restarts.
+            try:
+                for ev in await guild.fetch_scheduled_events():
+                    if ev.name == match.event_name:
+                        self.log.warning(
+                            f"Duplicate event {ev.id} for match {match.id} "
+                            f"({match.event_name}) detected — adopting instead of creating"
+                        )
+                        self.event_to_match[ev.id] = match.id
+                        match.discord_event_id = ev.id
+                        # Bring the adopted event up to current schedule/cover
+                        await self._update_discord_event(match)
+                        return
+            except Exception as scan_exc:
+                self.log.debug(
+                    f"Duplicate scan for match {match.id} failed "
+                    f"(proceeding with creation): {scan_exc}"
+                )
+
+            # Only create events for matches that haven't started yet
+            if match.start_time <= datetime.now(timezone.utc):
+                self.log.debug(f"Skipping event creation for past match {match.id}")
+                return
             event_start_time = self._event_api_start_time(match)
             end_time = self._event_end_time(match)
             event_cover_bytes = await self._build_event_cover_media(match)
