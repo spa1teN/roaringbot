@@ -64,6 +64,13 @@ CREATE TABLE IF NOT EXISTS esports_thread_map (
     match_id        BIGINT NOT NULL
 );
 
+-- Ping message ID -> match ID (CS large-role workaround: ping sent to summary channel instead of thread)
+CREATE TABLE IF NOT EXISTS esports_ping_map (
+    ping_id         BIGINT PRIMARY KEY,
+    match_id        BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_esports_ping_map_match ON esports_ping_map(match_id);
+
 -- Matches already seen, to avoid duplicate Discord events on restart, plus
 -- whether a CS score tracker has already been (or should be) started for it.
 CREATE TABLE IF NOT EXISTS esports_known_matches (

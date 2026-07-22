@@ -23,6 +23,7 @@ class EsportsRepository(BaseRepository):
         event_rows = await self.fetch("SELECT event_id, match_id FROM esports_event_map")
         reminder_rows = await self.fetch("SELECT reminder_id, match_id FROM esports_reminder_map")
         thread_rows = await self.fetch("SELECT thread_id, match_id FROM esports_thread_map")
+        ping_rows = await self.fetch("SELECT ping_id, match_id FROM esports_ping_map")
         known_rows = await self.fetch("SELECT match_id, monitored FROM esports_known_matches")
         tracker_rows = await self.fetch("SELECT * FROM cs_trackers")
         summary_row = await self.fetchrow("SELECT value FROM esports_state WHERE key = 'summary_message_id'")
@@ -32,6 +33,7 @@ class EsportsRepository(BaseRepository):
             "event_to_match": {r["event_id"]: r["match_id"] for r in event_rows},
             "reminder_to_match": {r["reminder_id"]: r["match_id"] for r in reminder_rows},
             "thread_to_match": {r["thread_id"]: r["match_id"] for r in thread_rows},
+            "ping_to_match": {r["ping_id"]: r["match_id"] for r in ping_rows},
             "summary_message_id": (json.loads(summary_row["value"]) if summary_row else None),
             "monitored_matches": [r["match_id"] for r in known_rows if r["monitored"]],
             "known_match_ids": [r["match_id"] for r in known_rows],
@@ -56,6 +58,7 @@ class EsportsRepository(BaseRepository):
         event_to_match: Dict[int, int],
         reminder_to_match: Dict[int, int],
         thread_to_match: Dict[int, int],
+        ping_to_match: Dict[int, int],
         summary_message_id: Optional[int],
         monitored_matches: Set[int],
         known_match_ids: Set[int],
@@ -85,6 +88,13 @@ class EsportsRepository(BaseRepository):
                     await conn.executemany(
                         "INSERT INTO esports_thread_map (thread_id, match_id) VALUES ($1, $2)",
                         list(thread_to_match.items()),
+                    )
+
+                await conn.execute("DELETE FROM esports_ping_map")
+                if ping_to_match:
+                    await conn.executemany(
+                        "INSERT INTO esports_ping_map (ping_id, match_id) VALUES ($1, $2)",
+                        list(ping_to_match.items()),
                     )
 
                 await conn.execute(

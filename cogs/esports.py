@@ -87,6 +87,7 @@ class EsportsMatch:
         self.discord_event_id: Optional[int] = None
         self.reminder_message_id: Optional[int] = None
         self.forum_thread_id: Optional[int] = None
+        self.ping_message_id: Optional[int] = None  # Summary-channel ping message (CS large-role workaround)
     
     @property
     def event_name(self) -> str:
@@ -272,18 +273,24 @@ TBA_SIZE = 512  # square placeholder matching a typical logo resolution
 
 
 def _make_tba_placeholder() -> bytes:
-    """Generate a square dark placeholder with 'TBA' in white sans-serif text.
+    """Generate a transparent square placeholder with large 'TBA' text.
     Returned as PNG bytes so it slots into the existing compose pipeline as if
-    it were a fetched opponent logo."""
+    it were a fetched opponent logo.  The transparent background matches real
+    team logos, and the large text fills most of the 512 px canvas so it stays
+    readable even after the 70 % scale-down applied in the 4:1 event-cover
+    composition."""
     from PIL import Image, ImageDraw, ImageFont
 
-    img = Image.new("RGBA", (TBA_SIZE, TBA_SIZE), (24, 24, 27, 255))
+    img = Image.new("RGBA", (TBA_SIZE, TBA_SIZE), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
     text = "TBA"
-    # Try a system font; fall back to the tiny PIL default if unavailable
+    # DejaVu Sans Bold is installed via the Dockerfile (fonts-dejavu-core).
+    # Fall back to the tiny PIL default if unavailable for any reason.
     try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size=100)
+        font = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size=200
+        )
     except (OSError, IOError):
         font = ImageFont.load_default()
 
@@ -292,7 +299,7 @@ def _make_tba_placeholder() -> bytes:
     draw.text(
         ((TBA_SIZE - tw) // 2, (TBA_SIZE - th) // 2 - bbox[1]),
         text,
-        fill=(180, 180, 180, 255),
+        fill=(200, 200, 200, 230),
         font=font,
     )
 
@@ -400,14 +407,14 @@ def build_reminder_view(match: "EsportsMatch", guild_id: Optional[int], mention:
 
 
 def build_weekly_view(upcoming_matches: List["EsportsMatch"], week_start, week_end,
-                      guild: Optional[discord.Guild], germany_tz) -> discord.ui.LayoutView:
+                      guild: Optional[discord.Guild], germany_tz,
+                      extra_row: Optional[discord.ui.ActionRow] = None) -> discord.ui.LayoutView:
     """CV2 weekly summary: header section with the (square-padded) BIG logo,
     one block per day with event-linked match lines. Expects big_square.png
     to be attached to the message."""
-    n = len(upcoming_matches)
     header = (
         f"## This Week ({week_start.strftime('%B %d')} - {(week_end - timedelta(days=1)).strftime('%B %d')})\n"
-        f"-# {n} match{'es' if n != 1 else ''} · Powered by [wannspieltbig.de](https://wannspieltbig.de)"
+        f"-# Powered by [wannspieltbig.de](https://wannspieltbig.de) · [status](https://casparsadenius.de/status/roaringbot)"
     )
 
     container = discord.ui.Container(accent_colour=discord.Colour(0x00FF88))
@@ -439,6 +446,10 @@ def build_weekly_view(upcoming_matches: List["EsportsMatch"], week_start, week_e
             container.add_item(discord.ui.TextDisplay(f"### {day}\n" + "\n".join(lines)))
             if i < len(days) - 1:
                 container.add_item(discord.ui.Separator())
+
+    if extra_row is not None:
+        container.add_item(discord.ui.Separator())
+        container.add_item(extra_row)
 
     view = discord.ui.LayoutView(timeout=None)
     view.add_item(container)
@@ -758,6 +769,7 @@ class EsportsCog(commands.Cog):
         self.event_to_match: Dict[int, int] = {}  # Discord event ID -> match ID
         self.reminder_to_match: Dict[int, int] = {}  # Reminder message ID -> match ID
         self.thread_to_match: Dict[int, int] = {}  # Forum thread ID -> match ID
+        self.ping_to_match: Dict[int, int] = {}  # Ping message ID -> match ID (CS large-role workaround)
         self.event_start_failures: Dict[int, int] = {}  # event ID -> consecutive failure count
         self._versus_cache: Dict[int, Tuple[str, bytes]] = {}  # match ID -> (logo URL, composed PNG)
         self.event_not_found_count: Dict[int, int] = {}  # event ID -> consecutive NotFound count
@@ -790,6 +802,7 @@ class EsportsCog(commands.Cog):
             self.event_to_match = data["event_to_match"]
             self.reminder_to_match = data["reminder_to_match"]
             self.thread_to_match = data["thread_to_match"]
+            self.ping_to_match = data.get("ping_to_match", {})
             self.summary_message_id = data["summary_message_id"]
             self.monitored_matches = set(data["monitored_matches"])
             self.known_match_ids = set(data["known_match_ids"])
@@ -826,6 +839,7 @@ class EsportsCog(commands.Cog):
                 event_to_match=self.event_to_match,
                 reminder_to_match=self.reminder_to_match,
                 thread_to_match=self.thread_to_match,
+                ping_to_match=self.ping_to_match,
                 summary_message_id=self.summary_message_id,
                 monitored_matches=self.monitored_matches,
                 known_match_ids=set(self.matches.keys()),
@@ -1018,7 +1032,13 @@ class EsportsCog(commands.Cog):
                     if stored_match_id == match.id:
                         match.forum_thread_id = thread_id
                         break
-                
+
+                # Restore ping message ID from stored mappings
+                for ping_id, stored_match_id in self.ping_to_match.items():
+                    if stored_match_id == match.id:
+                        match.ping_message_id = ping_id
+                        break
+
                 current_matches[match.id] = match
             
             # Handle new, updated, and cancelled matches
@@ -1627,9 +1647,17 @@ class EsportsCog(commands.Cog):
             # created by transient NotFound in _update_discord_event or
             # _check_event_status_updates, and prevents the problem from
             # compounding across restarts.
+            # Only adopt when the event's start time is close to our match's
+            # target start — otherwise it's a name collision (e.g. two
+            # different "BIG vs. TBA" matches on different dates).
             try:
+                target_start = self._event_api_start_time(match)
                 for ev in await guild.fetch_scheduled_events():
                     if ev.name == match.event_name:
+                        if ev.start_time and target_start:
+                            delta = abs((ev.start_time - target_start).total_seconds())
+                            if delta > 7200:  # more than 2 h apart — different match
+                                continue
                         self.log.warning(
                             f"Duplicate event {ev.id} for match {match.id} "
                             f"({match.event_name}) detected — adopting instead of creating"
@@ -1963,7 +1991,69 @@ class EsportsCog(commands.Cog):
             
         except Exception as e:
             self.log.error(f"Error handling finished match {match.id}: {e}")
-    
+
+    def _build_upcoming_ephemeral_view(self, guild: Optional[discord.Guild]) -> Optional[discord.ui.LayoutView]:
+        """Build a CV2 ephemeral view matching the weekly overview style for
+        all matches after the current week.  Returns None when there are none."""
+        now_berlin = datetime.now(timezone.utc).astimezone(self.germany_tz)
+        days_since_monday = now_berlin.weekday()
+        week_start = now_berlin.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=days_since_monday)
+        week_end_utc = (week_start + timedelta(days=7)).astimezone(timezone.utc)
+
+        future = [
+            m for m in self.matches.values()
+            if not m.cancelled and m.start_time >= week_end_utc
+        ]
+        future.sort(key=lambda m: m.start_time)
+
+        if not future:
+            return None
+
+        n = len(future)
+        container = discord.ui.Container(accent_colour=discord.Colour(0x00FF88))
+        container.add_item(discord.ui.Section(
+            discord.ui.TextDisplay(
+                f"## Upcoming Matches\n"
+                f"-# {n} match{'es' if n != 1 else ''} after this week"
+            ),
+            accessory=discord.ui.Thumbnail(media="attachment://big_square.png"),
+        ))
+        container.add_item(discord.ui.Separator())
+
+        matches_by_day: Dict[str, List[str]] = {}
+        for match in future:
+            match_time = match.start_time.astimezone(self.germany_tz)
+            day_key = match_time.strftime("%A, %B %d")
+            game_emoji = GAME_EMOJI.get(match.game, "🎮")
+            label = f"{match_time.strftime('%H:%M')} - {match.team_a} vs {match.team_b}"
+            if match.discord_event_id and guild:
+                event_url = f"https://discord.com/events/{guild.id}/{match.discord_event_id}"
+                line = f"{game_emoji} **[{label}]({event_url})**"
+            else:
+                line = f"{game_emoji} **{label}**"
+            matches_by_day.setdefault(day_key, []).append(line)
+
+        days = list(matches_by_day.items())
+        for i, (day, lines) in enumerate(days):
+            container.add_item(discord.ui.TextDisplay(f"### {day}\n" + "\n".join(lines)))
+            if i < len(days) - 1:
+                container.add_item(discord.ui.Separator())
+
+        view = discord.ui.LayoutView(timeout=None)
+        view.add_item(container)
+        return view
+
+    async def _weekly_upcoming_callback(self, interaction: discord.Interaction):
+        """Button callback — show all matches after the current week as ephemeral."""
+        view = self._build_upcoming_ephemeral_view(interaction.guild)
+        if view is None:
+            await interaction.response.send_message(
+                "No upcoming matches after this week.", ephemeral=True,
+            )
+            return
+        file = discord.File("big_square.png", filename="big_square.png")
+        await interaction.response.send_message(file=file, view=view, ephemeral=True)
+
     async def _send_weekly_summary(self, channel: discord.TextChannel):
         """Send weekly summary of upcoming matches"""
         try:
@@ -2007,7 +2097,16 @@ class EsportsCog(commands.Cog):
             
             # New posts always use the CV2 layout (see build_weekly_view)
             guild = channel.guild or (self.bot.get_guild(config.esports_guild_id) if config.esports_guild_id else None)
-            view = build_weekly_view(upcoming_matches, week_start, week_end, guild, self.germany_tz)
+            btn_row = discord.ui.ActionRow()
+            btn = discord.ui.Button(
+                label="Next weeks",
+                style=discord.ButtonStyle.secondary,
+                custom_id="weekly_upcoming_btn",
+            )
+            btn.callback = self._weekly_upcoming_callback
+            btn_row.add_item(btn)
+            view = build_weekly_view(upcoming_matches, week_start, week_end, guild, self.germany_tz,
+                                     extra_row=btn_row)
             file = discord.File("big_square.png", filename="big_square.png")
             message = await channel.send(file=file, view=view)
             self.summary_message_id = message.id
@@ -2104,7 +2203,16 @@ class EsportsCog(commands.Cog):
 
             # Edit the existing CV2 message in place.
             message = await channel.fetch_message(self.summary_message_id)
-            view = build_weekly_view(upcoming_matches, week_start, week_end, channel.guild, self.germany_tz)
+            btn_row = discord.ui.ActionRow()
+            btn = discord.ui.Button(
+                label="Next weeks",
+                style=discord.ButtonStyle.secondary,
+                custom_id="weekly_upcoming_btn",
+            )
+            btn.callback = self._weekly_upcoming_callback
+            btn_row.add_item(btn)
+            view = build_weekly_view(upcoming_matches, week_start, week_end, channel.guild, self.germany_tz,
+                                     extra_row=btn_row)
             await message.edit(view=view, attachments=[discord.File("big_square.png", filename="big_square.png")])
             self.log.info(f"Updated weekly summary message {self.summary_message_id}")
             status_reporter.record(
@@ -2598,16 +2706,38 @@ class EsportsCog(commands.Cog):
             self.log.warning(f"Could not build event cover image for match {match.id}: {e}")
             return None
 
-    async def _send_delayed_ping(self, thread: discord.Thread, mention_text: str, match_id: int):
+    async def _send_delayed_ping(self, thread: discord.Thread, mention_text: str, match_id: int,
+                                  summary_channel: Optional[discord.TextChannel] = None):
         """Users reported missing notifications when the role ping followed the
         reminder message immediately — give Discord a moment to settle the new
-        thread before pinging."""
+        thread before pinging.
+
+        When *summary_channel* is provided the ping is sent there (with a jump
+        link to the thread) and tracked for automatic cleanup when the match
+        ends.  This bypasses Discord's 250-member thread role-ping limit."""
         try:
             await asyncio.sleep(self.REMINDER_PING_DELAY)
-            await thread.send(
-                content=mention_text,
-                allowed_mentions=discord.AllowedMentions(roles=True),
-            )
+            match = self.matches.get(match_id)
+            if summary_channel and match:
+                # CS workaround: ping in summary channel (bypasses thread limit)
+                jump_link = (
+                    f"https://discord.com/channels/{thread.guild.id}"
+                    f"/{thread.id}/{match.reminder_message_id}"
+                )
+                content = f"{mention_text} — {match.event_name}\n🔗 {jump_link}"
+                msg = await summary_channel.send(
+                    content=content,
+                    allowed_mentions=discord.AllowedMentions(roles=True),
+                )
+                match.ping_message_id = msg.id
+                self.ping_to_match[msg.id] = match_id
+                await self._save_data()
+            else:
+                # Original behavior: ping in thread (works for ≤250 member roles)
+                await thread.send(
+                    content=mention_text,
+                    allowed_mentions=discord.AllowedMentions(roles=True),
+                )
         except Exception as e:
             self.log.error(f"Failed to send delayed reminder ping for match {match_id}: {e}")
 
@@ -2687,6 +2817,12 @@ class EsportsCog(commands.Cog):
                     return discord.File(io.BytesIO(versus_bytes), filename="versus.png")
                 return discord.File("big.png", filename="big.png")
 
+            # CS matches with large ping roles (>250 members) need the ping in the
+            # summary channel instead of the thread — Discord caps thread role pings.
+            cs_channel = None
+            if match.game == "cs" and config.esports_summary_channel_id:
+                cs_channel = self.bot.get_channel(config.esports_summary_channel_id)
+
             # Create/reuse forum thread if configured — ping goes into the thread
             if config.esports_forum_channel_id:
                 forum_channel = self.bot.get_channel(config.esports_forum_channel_id)
@@ -2705,7 +2841,10 @@ class EsportsCog(commands.Cog):
                                     await existing.edit(archived=False)
                                 msg = await existing.send(view=view, file=reminder_file())
                                 if mention_text:
-                                    asyncio.create_task(self._send_delayed_ping(existing, mention_text, match.id))
+                                    asyncio.create_task(self._send_delayed_ping(
+                                        existing, mention_text, match.id,
+                                        summary_channel=cs_channel,
+                                    ))
                                 match.reminder_message_id = msg.id
                                 self.reminder_to_match[msg.id] = match.id
                                 await self._save_data()
@@ -2730,7 +2869,10 @@ class EsportsCog(commands.Cog):
                         self.reminder_to_match[thread_with_msg.message.id] = match.id
                         # Send ping as separate, delayed message so Discord triggers proper notifications
                         if mention_text:
-                            asyncio.create_task(self._send_delayed_ping(forum_thread, mention_text, match.id))
+                            asyncio.create_task(self._send_delayed_ping(
+                                forum_thread, mention_text, match.id,
+                                summary_channel=cs_channel,
+                            ))
                         await self._save_data()
                         self.log.info(f"Sent 30-minute reminder (thread) for match {match.id}: {match.event_name}")
                         status_reporter.record(
@@ -2806,6 +2948,10 @@ class EsportsCog(commands.Cog):
                 stale_thread_ids = [tid for tid, mid in self.thread_to_match.items() if mid == match_id]
                 for tid in stale_thread_ids:
                     del self.thread_to_match[tid]
+                # Also clean up stale ping entries for this match_id
+                stale_ping_ids = [pid for pid, mid in self.ping_to_match.items() if mid == match_id]
+                for pid in stale_ping_ids:
+                    del self.ping_to_match[pid]
             else:
                 # No thread — delete the channel message
                 try:
@@ -2824,6 +2970,20 @@ class EsportsCog(commands.Cog):
             if match_id:
                 self._versus_cache.pop(match_id, None)
 
+            # Delete the summary-channel ping message (CS large-role workaround)
+            if match and match.ping_message_id:
+                try:
+                    ping_msg = await channel.fetch_message(match.ping_message_id)
+                    await ping_msg.delete()
+                    self.log.info(f"Deleted ping message {match.ping_message_id}")
+                except discord.NotFound:
+                    self.log.debug(f"Ping message {match.ping_message_id} already deleted")
+                except Exception as e:
+                    self.log.warning(f"Failed to delete ping message {match.ping_message_id}: {e}")
+                if match.ping_message_id in self.ping_to_match:
+                    del self.ping_to_match[match.ping_message_id]
+                match.ping_message_id = None
+
         if reminders_to_delete:
             await self._save_data()
     
@@ -2836,29 +2996,45 @@ class EsportsCog(commands.Cog):
 
     async def _cleanup_match_reminder(self, match: EsportsMatch):
         """Clean up reminder message for a specific match"""
-        if not match.reminder_message_id:
-            return
+        if match.reminder_message_id:
+            if match.forum_thread_id:
+                # Thread message — just archive the thread
+                self._close_forum_thread(match.forum_thread_id, match.id)
+            elif config.esports_summary_channel_id:
+                # Channel message — delete it
+                try:
+                    channel = self.bot.get_channel(config.esports_summary_channel_id)
+                    if channel:
+                        message = await channel.fetch_message(match.reminder_message_id)
+                        await message.delete()
+                        self.log.info(f"Deleted reminder message {match.reminder_message_id} for match {match.id}")
+                except discord.NotFound:
+                    self.log.debug(f"Reminder message {match.reminder_message_id} already deleted")
+                except Exception as e:
+                    self.log.warning(f"Failed to delete reminder message {match.reminder_message_id}: {e}")
 
-        if match.forum_thread_id:
-            # Thread message — just archive the thread
-            self._close_forum_thread(match.forum_thread_id, match.id)
-        elif config.esports_summary_channel_id:
-            # Channel message — delete it
+            # Clean up mappings
+            if match.reminder_message_id in self.reminder_to_match:
+                del self.reminder_to_match[match.reminder_message_id]
+            match.reminder_message_id = None
+
+        # Delete the summary-channel ping message (CS large-role workaround)
+        if match.ping_message_id:
             try:
-                channel = self.bot.get_channel(config.esports_summary_channel_id)
-                if channel:
-                    message = await channel.fetch_message(match.reminder_message_id)
-                    await message.delete()
-                    self.log.info(f"Deleted reminder message {match.reminder_message_id} for match {match.id}")
+                if config.esports_summary_channel_id:
+                    ch = self.bot.get_channel(config.esports_summary_channel_id)
+                    if ch:
+                        msg = await ch.fetch_message(match.ping_message_id)
+                        await msg.delete()
+                        self.log.info(f"Deleted ping message {match.ping_message_id} for match {match.id}")
             except discord.NotFound:
-                self.log.debug(f"Reminder message {match.reminder_message_id} already deleted")
+                self.log.debug(f"Ping message {match.ping_message_id} already deleted")
             except Exception as e:
-                self.log.warning(f"Failed to delete reminder message {match.reminder_message_id}: {e}")
+                self.log.warning(f"Failed to delete ping message {match.ping_message_id}: {e}")
+            if match.ping_message_id in self.ping_to_match:
+                del self.ping_to_match[match.ping_message_id]
+            match.ping_message_id = None
 
-        # Clean up mappings
-        if match.reminder_message_id in self.reminder_to_match:
-            del self.reminder_to_match[match.reminder_message_id]
-        match.reminder_message_id = None
         await self._save_data()
     
 
