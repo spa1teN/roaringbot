@@ -1,0 +1,7 @@
+{
+  "<guild_id>": {
+    "member_log_webhook": "https://discord.com/api/webhooks/.../...",
+    "join_role": null,
+    "honeypot_role": null
+  }
+}

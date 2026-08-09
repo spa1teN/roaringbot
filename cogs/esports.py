@@ -315,7 +315,7 @@ def compose_versus_image(opponent_png: bytes) -> bytes:
 
     W, H = VERSUS_SIZE
     canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    big = Image.open("big.png").convert("RGBA")
+    big = Image.open("resources/big.png").convert("RGBA")
     opponent = Image.open(io.BytesIO(opponent_png)).convert("RGBA")
 
     half = W // 2
@@ -342,7 +342,7 @@ def compose_event_cover_image(opponent_png: bytes) -> bytes:
 
     W, H = EVENT_COVER_SIZE
     canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    big = Image.open("big.png").convert("RGBA")
+    big = Image.open("resources/big.png").convert("RGBA")
     opponent = Image.open(io.BytesIO(opponent_png)).convert("RGBA")
 
     half = W // 2
@@ -399,6 +399,43 @@ def build_reminder_view(match: "EsportsMatch", guild_id: Optional[int], mention:
             url=f"https://discord.com/events/{guild_id}/{match.discord_event_id}",
         ))
     row.add_item(discord.ui.Button(style=discord.ButtonStyle.link, label="wannspieltbig", url=match.detail_url))
+    container.add_item(row)
+
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(container)
+    return view
+
+
+def build_cs_ping_view(match: "EsportsMatch", thread_id: int, guild_id: int,
+                       versus: bool = False) -> discord.ui.LayoutView:
+    """CV2 summary-channel ping message: same layout as the thread reminder
+    but with a single "Match Thread" link button instead of Voice+wannspieltbig.
+    The role ping goes in message.content, not inside the CV2 container."""
+    unix_ts = int(match.start_time.timestamp())
+    game_emoji = GAME_EMOJI.get(match.game, "🎮")
+
+    container = discord.ui.Container(accent_colour=discord.Colour(0xFF6B35))
+
+    gallery = discord.ui.MediaGallery()
+    if versus:
+        gallery.add_item(media="attachment://versus.png")
+    else:
+        gallery.add_item(media="attachment://big.png")
+        if match.team_b_logo_url:
+            gallery.add_item(media=match.team_b_logo_url)
+    container.add_item(gallery)
+
+    container.add_item(discord.ui.TextDisplay(
+        f"## {match.team_a} vs {match.team_b} — <t:{unix_ts}:R>\n"
+        f"-# {game_emoji} {match.tournament_name} · Best of {match.bestof} · <t:{unix_ts}:t> Uhr"
+    ))
+
+    row = discord.ui.ActionRow()
+    row.add_item(discord.ui.Button(
+        style=discord.ButtonStyle.link,
+        label="Match Thread",
+        url=f"https://discord.com/channels/{guild_id}/{thread_id}",
+    ))
     container.add_item(row)
 
     view = discord.ui.LayoutView(timeout=None)
@@ -2051,7 +2088,7 @@ class EsportsCog(commands.Cog):
                 "No upcoming matches after this week.", ephemeral=True,
             )
             return
-        file = discord.File("big_square.png", filename="big_square.png")
+        file = discord.File("resources/big_square.png", filename="big_square.png")
         await interaction.response.send_message(file=file, view=view, ephemeral=True)
 
     async def _send_weekly_summary(self, channel: discord.TextChannel):
@@ -2107,7 +2144,7 @@ class EsportsCog(commands.Cog):
             btn_row.add_item(btn)
             view = build_weekly_view(upcoming_matches, week_start, week_end, guild, self.germany_tz,
                                      extra_row=btn_row)
-            file = discord.File("big_square.png", filename="big_square.png")
+            file = discord.File("resources/big_square.png", filename="big_square.png")
             message = await channel.send(file=file, view=view)
             self.summary_message_id = message.id
             await self._save_data()  # Save the new message ID
@@ -2213,7 +2250,7 @@ class EsportsCog(commands.Cog):
             btn_row.add_item(btn)
             view = build_weekly_view(upcoming_matches, week_start, week_end, channel.guild, self.germany_tz,
                                      extra_row=btn_row)
-            await message.edit(view=view, attachments=[discord.File("big_square.png", filename="big_square.png")])
+            await message.edit(view=view, attachments=[discord.File("resources/big_square.png", filename="big_square.png")])
             self.log.info(f"Updated weekly summary message {self.summary_message_id}")
             status_reporter.record(
                 "esports",
@@ -2707,28 +2744,43 @@ class EsportsCog(commands.Cog):
             return None
 
     async def _send_delayed_ping(self, thread: discord.Thread, mention_text: str, match_id: int,
-                                  summary_channel: Optional[discord.TextChannel] = None):
+                                  summary_channel: Optional[discord.TextChannel] = None,
+                                  versus_bytes: Optional[bytes] = None):
         """Users reported missing notifications when the role ping followed the
         reminder message immediately — give Discord a moment to settle the new
         thread before pinging.
 
-        When *summary_channel* is provided the ping is sent there (with a jump
-        link to the thread) and tracked for automatic cleanup when the match
-        ends.  This bypasses Discord's 250-member thread role-ping limit."""
+        When *summary_channel* is provided a CV2 message (same design as the
+        thread reminder but with a single "Match Thread" button) is sent there,
+        with the role ping in ``content`` so recipients get notified.  This
+        bypasses Discord's 250-member thread role-ping limit."""
         try:
             await asyncio.sleep(self.REMINDER_PING_DELAY)
             match = self.matches.get(match_id)
             if summary_channel and match:
-                # CS workaround: ping in summary channel (bypasses thread limit)
-                jump_link = (
-                    f"https://discord.com/channels/{thread.guild.id}"
-                    f"/{thread.id}/{match.reminder_message_id}"
-                )
-                content = f"{mention_text} — {match.event_name}\n🔗 {jump_link}"
-                msg = await summary_channel.send(
-                    content=content,
+                # CS workaround: CV2 card + plain ping in summary channel
+                # (bypasses Discord's 250-member thread role-ping limit).
+                # CV2 messages cannot carry `content`, so the role ping is a
+                # separate plain-text message that triggers notifications.
+                guild_id = thread.guild.id
+                versus = versus_bytes is not None
+
+                # 1) Plain-text role ping — triggers push notifications
+                await summary_channel.send(
+                    content=mention_text,
                     allowed_mentions=discord.AllowedMentions(roles=True),
                 )
+
+                # 2) CV2 card — same design as the thread reminder but with
+                #    a single "Match Thread" link button
+                view = build_cs_ping_view(match, thread.id, guild_id, versus=versus)
+
+                if versus:
+                    file = discord.File(io.BytesIO(versus_bytes), filename="versus.png")
+                else:
+                    file = discord.File("resources/big.png", filename="big.png")
+
+                msg = await summary_channel.send(view=view, file=file)
                 match.ping_message_id = msg.id
                 self.ping_to_match[msg.id] = match_id
                 await self._save_data()
@@ -2777,7 +2829,7 @@ class EsportsCog(commands.Cog):
                 if versus_bytes is not None:
                     attachment = discord.File(io.BytesIO(versus_bytes), filename="versus.png")
                 else:
-                    attachment = discord.File("big.png", filename="big.png")
+                    attachment = discord.File("resources/big.png", filename="big.png")
                 await message.edit(view=view, attachments=[attachment])
                 self.log.info(f"Edited reminder for rescheduled match {match.id}: {match.event_name}")
             else:
@@ -2815,7 +2867,7 @@ class EsportsCog(commands.Cog):
                 # discord.File objects are single-use — build a fresh one per send
                 if versus:
                     return discord.File(io.BytesIO(versus_bytes), filename="versus.png")
-                return discord.File("big.png", filename="big.png")
+                return discord.File("resources/big.png", filename="big.png")
 
             # CS matches with large ping roles (>250 members) need the ping in the
             # summary channel instead of the thread — Discord caps thread role pings.
@@ -2844,6 +2896,7 @@ class EsportsCog(commands.Cog):
                                     asyncio.create_task(self._send_delayed_ping(
                                         existing, mention_text, match.id,
                                         summary_channel=cs_channel,
+                                        versus_bytes=versus_bytes,
                                     ))
                                 match.reminder_message_id = msg.id
                                 self.reminder_to_match[msg.id] = match.id
@@ -2872,6 +2925,7 @@ class EsportsCog(commands.Cog):
                             asyncio.create_task(self._send_delayed_ping(
                                 forum_thread, mention_text, match.id,
                                 summary_channel=cs_channel,
+                                versus_bytes=versus_bytes,
                             ))
                         await self._save_data()
                         self.log.info(f"Sent 30-minute reminder (thread) for match {match.id}: {match.event_name}")

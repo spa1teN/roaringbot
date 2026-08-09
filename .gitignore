@@ -1,5 +1,5 @@
 # Environment & secrets
-.env*
+.env
 config/google_credentials.json
 config/kassenbuch_credentials.json
 
@@ -18,7 +18,6 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyc
-*~
 *.bak
 
 # Virtual environments

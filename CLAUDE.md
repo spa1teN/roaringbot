@@ -169,7 +169,7 @@ RoaringBot/
 ├── CLAUDE.md
 ├── DATA_INTERFACE.md      # API- und Status-JSON-Contract
 ├── Dockerfile / docker-compose.yml
-├── big.png / big_square.png / pb.png
+├── resources/             # big.png, big_square.png, pb.png
 ├── cogs/                  # birthday.py, esports.py, feedback.py, finance.py, moderation.py
 ├── core/                  # api_server.py, config.py, status_reporter.py, colors.py,
 │                          #   http_client.py, timezone_util.py, cache_manager.py,
@@ -188,6 +188,6 @@ Siehe `.env.example`. Kritische Besonderheiten:
 - `WSB_User` / `WSB_PW` — exakte Schreibweise! Basic Auth für wannspieltbig-API-PUTs.
 - `ESPORTS_VC1` / `ESPORTS_VC2` — Voice-Channel-IDs für "VC 1"/"VC 2"-Events.
 - `PING_CS` / `PING_LOL` / `PING_TM` — Game-spezifische Reminder-Ping-Roles.
-- `REMINDER_PING_DELAY` — Sekunden Verzögerung zwischen Reminder und Ping (Default 30).
+- `REMINDER_PING_DELAY` — Sekunden Verzögerung zwischen Reminder und Ping (Default 60, hardcoded in `esports.py`).
 - `BIRTHDAY_EMOTE_ID` — Nur die ID; der Emote-Name (`tabsSax`) ist hardcoded.
 - `ESPORTS_FORUM_CHANNEL_ID` — Fehlt → Reminder fallen zurück auf Summary-Channel.

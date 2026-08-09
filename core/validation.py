@@ -179,7 +179,6 @@ class SystemValidator:
             'discord': 'discord.py',
             'aiohttp': 'aiohttp',
             'feedparser': 'feedparser',
-            'psutil': 'psutil',
             'requests': 'requests',
             'yaml': 'PyYAML'
         }

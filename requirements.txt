@@ -12,9 +12,6 @@ aiohttp>=3.8.0
 # Database
 asyncpg>=0.29.0
 
-# System Monitoring
-psutil>=5.9.0
-
 # Feed Parsing
 feedparser>=6.0.10
 
@@ -29,14 +26,3 @@ pytz>=2023.3
 
 # Reminder versus-image compositing
 Pillow>=10.0.0
-
-# Base64 encoding (built-in module, no requirement needed)
-# JSON (built-in module, no requirement needed)
-# Asyncio (built-in module, no requirement needed)
-# Pathlib (built-in module, no requirement needed)
-# Datetime (built-in module, no requirement needed)
-# Logging (built-in module, no requirement needed)
-# Math (built-in module, no requirement needed)
-# Collections (built-in module, no requirement needed)
-# Re (built-in module, no requirement needed)
-# OS (built-in module, no requirement needed)
