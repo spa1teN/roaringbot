@@ -57,9 +57,18 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
 - **Ende ausschließlich durch wannspieltbig-Signale**, nie durch Zeitschätzung:
   CS-Livescore-Loop beendet bei echtem Finish; API-verschwundene Matches via
   `_handle_match_finished`.
-- Missing event → erst nach 2 konsekutiven NotFound-Polls neu erstellen.
+- Missing event → erst nach 2 konsekutiven NotFound-Polls neu erstellen
+  (`event_not_found_count`). **Transiente API-Fehler (503, 522, Timeout) werden
+  NICHT als "event gone" gezählt** — nur echte 404er incrementieren den Counter.
+  Gleiche 2-Strike-Regel gilt in `_update_discord_event` und
+  `_check_event_status_updates`.
 - `_reconcile_event_schedule`: Korrigiert Start/Ende jedes Polls (nur wenn > 60 s
   Drift, nie < 2 min vor Start) — Events alter Code-Versionen heilen sich selbst.
+- **Duplicate-Event-Prevention**: `_create_discord_event` scannt vor Creation alle
+  Guild-Events auf gleichen Namen + Startzeit (±2 h). Scan-Fehler (z. B. 503 beim
+  `fetch_scheduled_events`) → **Abbruch** der Creation (kein Silent-Proceed).
+  `_dedup_guild_events` läuft einmal pro Poll-Zyklus und löscht echte Duplikate
+  (Name + Zeitfenster), behält das in `event_to_match` getrackte Event.
 
 **CS Livescore-Tracking:**
 - Startet 4–5 min vor jedem CS-Match automatisch (kein manueller Befehl).
@@ -95,6 +104,18 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
   (`REMINDER_PING_DELAY`) in separater Nachricht.
 - Opponent-Logo via images.weserv.nl-Proxy (HLTV-CDN blockt Server-IPs); Fallback:
   alte Two-Tile-Gallery.
+- **Ping-Card (CS-Large-Role-Workaround)**: CV2-Karte im Summary-Channel mit
+  "Match Thread"-Button, umgeht Discords 250-Member-Thread-Ping-Limit.
+- **Reschedule/Update**: `_edit_reminder_message` aktualisiert bei Time- oder
+  Opponent-Änderung **sowohl** die Thread-Nachricht (`reminder_message_id`) **als
+  auch** die Ping-Card (`ping_message_id`) und **benennt den Thread um**, falls
+  `team_a`/`team_b` sich geändert haben. Frisches `discord.File` pro Edit
+  (BytesIO-Streams sind nach dem ersten Edit verbraucht).
+- **Startup-Reconciliation**: `_reconcile_all_reminders` bringt nach dem ersten
+  Poll nach Restart alle existierenden Reminder/Ping-Cards/Thread-Titles auf den
+  aktuellen API-Stand — fängt Änderungen, die während Downtime/Crash passiert sind.
+- Reminder + Ping-Card werden automatisch gelöscht, wenn der Match endet
+  (`_check_for_reminder_cleanup`).
 
 **Weekly Summary:** Eine durchgehend editierte Nachricht pro Woche (Mo–So
 Europe/Berlin). Wochenwechsel → alte löschen, neue posten. CV2 mit Club-Logo

@@ -808,6 +808,7 @@ class EsportsCog(commands.Cog):
         self.thread_to_match: Dict[int, int] = {}  # Forum thread ID -> match ID
         self.ping_to_match: Dict[int, int] = {}  # Ping message ID -> match ID (CS large-role workaround)
         self.event_start_failures: Dict[int, int] = {}  # event ID -> consecutive failure count
+        self._first_poll_done: bool = False  # set after first successful poll post-startup
         self._versus_cache: Dict[int, Tuple[str, bytes]] = {}  # match ID -> (logo URL, composed PNG)
         self.event_not_found_count: Dict[int, int] = {}  # event ID -> consecutive NotFound count
         self._event_status_by_match: Dict[int, discord.EventStatus] = {}  # match ID -> last observed Discord event status (this poll)
@@ -951,6 +952,7 @@ class EsportsCog(commands.Cog):
         if stale:
             for eid in stale:
                 mid = self.event_to_match.pop(eid)
+                self.event_not_found_count.pop(eid, None)
                 self.log.info(f"Removed stale event_to_match entry on startup: event {eid} -> match {mid}")
             await self._save_data()
 
@@ -1080,13 +1082,25 @@ class EsportsCog(commands.Cog):
             
             # Handle new, updated, and cancelled matches
             await self._process_match_updates(current_matches)
-            
+
+            # On the first poll after startup, reconcile existing reminders,
+            # ping cards, and thread titles against current match data.
+            # Catches changes that happened while the bot was down or crashing,
+            # which the normal update-detection path would miss (it needs an
+            # old_match to compare against, which doesn't exist on first poll).
+            if not self._first_poll_done:
+                self._first_poll_done = True
+                await self._reconcile_all_reminders(current_matches)
+
             # Check for CS matches starting soon
             await self._check_for_starting_matches()
             
             # Check for Discord events needing status updates
             await self._check_event_status_updates()
-            
+
+            # Clean up duplicate events (orphans from pre-fix transient-error bugs)
+            await self._dedup_guild_events()
+
             # Check for matches needing 30-minute reminders
             await self._check_for_match_reminders()
             
@@ -1453,12 +1467,11 @@ class EsportsCog(commands.Cog):
                     if not match.discord_event_id:
                         await self._create_discord_event(match)
                 elif not match.cancelled and self._match_needs_update(old_match, match):
-                    # Match details changed
-                    if old_match.start_time != match.start_time:
-                        if match.reminder_message_id:
-                            # Edit the existing reminder message with the new time
-                            await self._edit_reminder_message(match)
-                        # else: no reminder sent yet, will fire normally at 30-min mark
+                    # Match details changed (time, opponent, tournament, etc.)
+                    if match.reminder_message_id:
+                        # Edit the existing reminder/ping messages and thread title
+                        await self._edit_reminder_message(match)
+                    # else: no reminder sent yet, will fire normally at 30-min mark
                     await self._update_discord_event(match)
                 elif not match.cancelled and not match.discord_event_id and match.start_time > datetime.now(timezone.utc):
                     # Belt-and-suspenders: existing match lost its event (e.g., mapping cleared last cycle)
@@ -1705,10 +1718,11 @@ class EsportsCog(commands.Cog):
                         await self._update_discord_event(match)
                         return
             except Exception as scan_exc:
-                self.log.debug(
+                self.log.warning(
                     f"Duplicate scan for match {match.id} failed "
-                    f"(proceeding with creation): {scan_exc}"
+                    f"— skipping creation to avoid potential duplicate: {scan_exc}"
                 )
+                return
 
             # Only create events for matches that haven't started yet
             if match.start_time <= datetime.now(timezone.utc):
@@ -1780,7 +1794,9 @@ class EsportsCog(commands.Cog):
             # Find the guild and event
             guild = None
             event = None
-            
+            genuine_not_found = False  # True when we got a real 404
+            transient_failure = False  # True when we got a transient error (503, etc.)
+
             if config.esports_guild_id:
                 # Use configured guild if specified
                 guild = self.bot.get_guild(config.esports_guild_id)
@@ -1789,8 +1805,10 @@ class EsportsCog(commands.Cog):
                         event = await guild.fetch_scheduled_event(match.discord_event_id)
                     except discord.NotFound:
                         self.log.warning(f"Event {match.discord_event_id} not found in configured guild {config.esports_guild_id}")
+                        genuine_not_found = True
                     except Exception as e:
-                        self.log.debug(f"Error fetching event from configured guild: {e}")
+                        self.log.warning(f"Error fetching event from configured guild: {e}")
+                        transient_failure = True
             else:
                 # Search through all guilds (original behavior)
                 for g in self.bot.guilds:
@@ -1799,22 +1817,50 @@ class EsportsCog(commands.Cog):
                         guild = g
                         break
                     except discord.NotFound:
+                        genuine_not_found = True
                         continue
                     except Exception as e:
-                        self.log.debug(f"Error fetching event from guild {g.id}: {e}")
+                        self.log.warning(f"Error fetching event from guild {g.id}: {e}")
+                        transient_failure = True
                         continue
-            
+
             if not event:
+                # Transient API errors (503, 522, timeouts) are NOT the event
+                # being gone — skip this cycle and retry next poll.
+                if transient_failure and not genuine_not_found:
+                    self.log.debug(
+                        f"Skipping event {match.discord_event_id} for match {match.id} "
+                        f"this cycle — fetch failed with transient error"
+                    )
+                    return
+
+                # Only recreate after 2 consecutive NotFound to guard against
+                # transient API errors (same rule as _check_event_status_updates).
+                event_id = match.discord_event_id
+                count = self.event_not_found_count.get(event_id, 0) + 1
+                self.event_not_found_count[event_id] = count
+                if count < 2:
+                    self.log.warning(
+                        f"Discord event {event_id} not found for match {match.id} "
+                        f"(attempt {count}/2) — will verify next cycle before recreating"
+                    )
+                    return
+                # Second consecutive NotFound — treat as genuinely gone
+                self.event_not_found_count.pop(event_id, None)
                 self.log.warning(
-                    f"Discord event {match.discord_event_id} not found for match {match.id} — will recreate"
+                    f"Discord event {event_id} not found for match {match.id} "
+                    f"after {count} attempts — recreating"
                 )
                 # Remove invalid mapping
-                if match.discord_event_id in self.event_to_match:
-                    del self.event_to_match[match.discord_event_id]
+                if event_id in self.event_to_match:
+                    del self.event_to_match[event_id]
                 match.discord_event_id = None
                 # Recreate so the match still has a Discord presence
                 await self._create_discord_event(match)
                 return
+
+            # Event was found — reset NotFound counter
+            self.event_not_found_count.pop(match.discord_event_id, None)
             
             # Event should go live 5 minutes before the real kickoff; the end
             # time stays relative to the real kickoff (see _event_end_time).
@@ -2456,6 +2502,101 @@ class EsportsCog(commands.Cog):
 
         return (other_channel, other_label)
 
+    async def _reconcile_all_reminders(self, current_matches: dict):
+        """After a restart, bring all existing reminders/pings/threads in sync
+        with current match data.  Without this, changes that happened while the
+        bot was down are never detected because the normal update path needs an
+        old_match to compare against (which doesn't exist on the first poll)."""
+        for match_id, match in current_matches.items():
+            if not match.reminder_message_id:
+                continue
+            if match.cancelled:
+                continue
+            try:
+                await self._edit_reminder_message(match)
+            except Exception as e:
+                self.log.debug(
+                    f"Startup reminder reconciliation for match {match_id} "
+                    f"failed (non-fatal): {e}"
+                )
+
+    async def _dedup_guild_events(self):
+        """Delete duplicate Discord events with the same name and close start times.
+
+        Called once per poll cycle.  Groups all scheduled events by name; when
+        multiple events share a name and start within 2 h of each other, the
+        one tracked in event_to_match is kept (or the earliest one if none are
+        tracked) and the rest are deleted.  This cleans up orphans created
+        before the duplicate scan and 2-strike rules were hardened.
+        """
+        # Find the guild
+        guild = None
+        if config.esports_guild_id:
+            guild = self.bot.get_guild(config.esports_guild_id)
+        elif self.bot.guilds:
+            guild = self.bot.guilds[0]
+        if not guild:
+            return
+
+        try:
+            events = await guild.fetch_scheduled_events()
+        except Exception as e:
+            self.log.debug(f"_dedup_guild_events: could not fetch events: {e}")
+            return
+
+        # Group by event name
+        by_name: dict[str, list[discord.ScheduledEvent]] = {}
+        for ev in events:
+            by_name.setdefault(ev.name, []).append(ev)
+
+        for name, group in by_name.items():
+            if len(group) <= 1:
+                continue
+
+            # Sort into clusters whose start times are within 2 h
+            group.sort(key=lambda e: e.start_time or datetime.now(timezone.utc))
+            clusters: list[list[discord.ScheduledEvent]] = []
+            for ev in group:
+                placed = False
+                for cluster in clusters:
+                    ref = cluster[0]
+                    if (ev.start_time and ref.start_time and
+                            abs((ev.start_time - ref.start_time).total_seconds()) <= 7200):
+                        cluster.append(ev)
+                        placed = True
+                        break
+                if not placed:
+                    clusters.append([ev])
+
+            for cluster in clusters:
+                if len(cluster) <= 1:
+                    continue
+                # Prefer the event tracked in event_to_match; otherwise keep
+                # the earliest one.
+                tracked = next((e for e in cluster if e.id in self.event_to_match), None)
+                keeper = tracked if tracked else cluster[0]
+                for ev in cluster:
+                    if ev.id == keeper.id:
+                        continue
+                    self.log.warning(
+                        f"_dedup_guild_events: deleting duplicate event {ev.id} "
+                        f"(\"{ev.name}\", {ev.start_time}) — keeping {keeper.id}"
+                    )
+                    try:
+                        await ev.delete()
+                    except Exception as del_exc:
+                        self.log.warning(
+                            f"_dedup_guild_events: could not delete event {ev.id}: {del_exc}"
+                        )
+                    # If we deleted a tracked event (shouldn't happen with the
+                    # preference logic above, but be defensive), clean up.
+                    if ev.id in self.event_to_match:
+                        self.log.warning(
+                            f"_dedup_guild_events: deleted tracked event {ev.id} — "
+                            f"clearing mapping"
+                        )
+                        del self.event_to_match[ev.id]
+
     async def _check_event_status_updates(self):
         """Check for Discord events that need status updates (start/end)"""
         now = datetime.now(timezone.utc)
@@ -2469,6 +2610,8 @@ class EsportsCog(commands.Cog):
             event = None
             guild = None
             
+            transient_failure = False  # track non-NotFound errors to avoid miscounting
+
             if config.esports_guild_id:
                 # Use configured guild if specified
                 guild = self.bot.get_guild(config.esports_guild_id)
@@ -2476,12 +2619,13 @@ class EsportsCog(commands.Cog):
                     try:
                         event = await guild.fetch_scheduled_event(event_id)
                     except discord.NotFound:
-                        pass
+                        pass  # genuinely gone — will be counted below
                     except Exception as fetch_exc:
                         self.log.warning(
                             f"Could not fetch event {event_id} for match {match_id}: "
                             f"{type(fetch_exc).__name__}: {fetch_exc}"
                         )
+                        transient_failure = True
             else:
                 # Search through all guilds (original behavior)
                 for g in self.bot.guilds:
@@ -2490,13 +2634,24 @@ class EsportsCog(commands.Cog):
                         guild = g
                         break
                     except discord.NotFound:
-                        continue
+                        continue  # genuinely gone in this guild — try next
                     except Exception as fetch_exc:
                         self.log.warning(
                             f"Could not fetch event {event_id} from guild {g.id}: "
                             f"{type(fetch_exc).__name__}: {fetch_exc}"
                         )
+                        transient_failure = True
                         continue
+
+            # Transient API errors (503, 522, timeouts) are NOT the event being
+            # gone — skip this match entirely this poll cycle rather than
+            # miscounting toward the 2-strike recreate threshold.
+            if transient_failure and not event:
+                self.log.debug(
+                    f"Skipping event {event_id} for match {match_id} this cycle "
+                    f"— fetch failed with transient error, will retry next poll"
+                )
+                continue
             
             if not event:
                 # Only recreate after 2 consecutive NotFound to guard against transient API errors
@@ -2794,15 +2949,17 @@ class EsportsCog(commands.Cog):
             self.log.error(f"Failed to send delayed reminder ping for match {match_id}: {e}")
 
     async def _edit_reminder_message(self, match: EsportsMatch):
-        """Edit an existing reminder message after a reschedule"""
+        """Edit existing reminder/ping messages and thread title after a match update
+        (reschedule, opponent change, tournament change, etc.)"""
         try:
             guild_id = config.esports_guild_id or (self.bot.guilds[0].id if self.bot.guilds else None)
             versus_bytes = await self._build_reminder_media(match)
             view = build_reminder_view(match, guild_id, versus=versus_bytes is not None)
 
             message = None
+            thread = None
 
-            # Try forum thread first
+            # Try forum thread first — also grab the thread for title renaming
             if match.forum_thread_id:
                 thread = self.bot.get_channel(match.forum_thread_id)
                 if thread is None:
@@ -2831,7 +2988,55 @@ class EsportsCog(commands.Cog):
                 else:
                     attachment = discord.File("resources/big.png", filename="big.png")
                 await message.edit(view=view, attachments=[attachment])
-                self.log.info(f"Edited reminder for rescheduled match {match.id}: {match.event_name}")
+                self.log.info(f"Edited reminder for updated match {match.id}: {match.event_name}")
+
+                # Also edit the ping card in the summary channel (CS workaround).
+                # Must create a fresh discord.File — the BytesIO underlying the
+                # first attachment was consumed by message.edit() above.
+                if match.ping_message_id and config.esports_summary_channel_id:
+                    ping_channel = self.bot.get_channel(config.esports_summary_channel_id)
+                    if ping_channel and thread:
+                        try:
+                            ping_msg = await ping_channel.fetch_message(match.ping_message_id)
+                            ping_view = build_cs_ping_view(
+                                match, thread.id, guild_id, versus=versus_bytes is not None
+                            )
+                            if versus_bytes is not None:
+                                ping_attachment = discord.File(
+                                    io.BytesIO(versus_bytes), filename="versus.png"
+                                )
+                            else:
+                                ping_attachment = discord.File(
+                                    "resources/big.png", filename="big.png"
+                                )
+                            await ping_msg.edit(view=ping_view, attachments=[ping_attachment])
+                            self.log.info(
+                                f"Edited ping card for updated match {match.id}: {match.event_name}"
+                            )
+                        except discord.NotFound:
+                            self.log.debug(
+                                f"Ping card {match.ping_message_id} for match {match.id} "
+                                f"not found — will be replaced on next ping"
+                            )
+                            match.ping_message_id = None
+
+                # Rename the forum thread if team names changed
+                if thread and isinstance(thread, discord.Thread):
+                    game_name = {"cs": "CS", "tm": "TM", "lol": "LoL"}.get(
+                        match.game, match.game.upper()
+                    )
+                    expected_title = f"{match.team_a} vs {match.team_b} – {game_name}"
+                    if thread.name != expected_title:
+                        try:
+                            await thread.edit(name=expected_title)
+                            self.log.info(
+                                f"Renamed thread {thread.id} to \"{expected_title}\" "
+                                f"for updated match {match.id}"
+                            )
+                        except Exception as rename_exc:
+                            self.log.warning(
+                                f"Could not rename thread {thread.id} for match {match.id}: {rename_exc}"
+                            )
             else:
                 # Message no longer exists — clear tracking so a fresh reminder fires at 30-min mark
                 self.reminder_to_match = {k: v for k, v in self.reminder_to_match.items() if v != match.id}
