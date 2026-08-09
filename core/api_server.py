@@ -12,6 +12,14 @@ from typing import Any
 
 from aiohttp import web
 
+from core.share_pages import (
+    handle_share_image,
+    handle_share_list,
+    handle_share_match,
+    handle_share_next_match,
+    handle_share_slug_redirect,
+)
+
 log = logging.getLogger("roaringbot.api")
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -202,6 +210,17 @@ def create_app(bot: Any) -> web.Application:
     app.router.add_patch("/api/feedback/{id}/note", handle_set_note)
     app.router.add_get("/api/feedback/unread-count", handle_unread_count)
     app.router.add_get("/api/bot/avatar", handle_bot_avatar)
+
+    # Public WhatsApp-share pages (nginx exposes only /share/* and
+    # /share-match/* publicly)
+    app.router.add_get("/share/", handle_share_list)
+    app.router.add_get(r"/share/{match_id:\d+}/", handle_share_match)
+    app.router.add_get(r"/share/{match_id:\d+}/image.png", handle_share_image)
+    # Old slug-based URLs keep working (301 to the id-based URL)
+    app.router.add_get("/share/{slug}/", handle_share_slug_redirect)
+    app.router.add_get("/share/{slug}/image.png", handle_share_slug_redirect)
+    # Old-URL alias of the overview list (same page as /share/)
+    app.router.add_get("/share-match/", handle_share_next_match)
 
     return app
 

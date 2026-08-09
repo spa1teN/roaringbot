@@ -346,6 +346,29 @@ Empfohlene Proxy-Endpoints im Dashboard (`dashboard/app/main.py`):
 Die Proxy-Endpoints sind analog zu den bestehenden Tausendsassa-Feedback-Routen
 (`/api/tausendsassa/feedback/…`) aufgebaut.
 
+## WhatsApp Share Pages (öffentlich)
+
+Unter `roaringbot.casparsadenius.de` (nginx-proxied, **nur** `/share/*` wird
+öffentlich exponiert — alle anderen Pfade antworten 404, die Feedback-API
+bleibt intern) stellt der Bot öffentliche Share-Seiten für die
+WhatsApp-Channel-Bridge bereit. Implementiert in
+[`core/share_pages.py`](core/share_pages.py).
+
+### Endpunkte
+
+| Methode | Pfad | Zweck |
+|---|---|---|
+| `GET` | `/share/` | Übersichtsseite: eine Karte pro kommendem Match mit „Share to WhatsApp"-Button (teilt Match-Infos als Klartext + Match-URL) |
+| `GET` | `/share/{id}/` | Match-Seite über Match-ID: `og:`-Tags für die WhatsApp-Link-Preview (Versus-Bild via `og:image`, `og:url` = wannspieltbig-Match-Seite), danach Meta-Refresh + JS-Redirect auf `html_detail_url`. Funktioniert auch für beendete Matches |
+| `GET` | `/share/{id}/image.png` | Versus-PNG (1600×800, dunkler Hintergrund): Club-Logo links, Gegner-Logo rechts, unten Info-Zeile (Game · BO · Zeit) + Turnier-Zeile. `Cache-Control: public, max-age=3600` |
+| `GET` | `/share/{slug}/` · `/share/{slug}/image.png` | Kompatibilität: alte Slug-URLs → 301 auf die ID-Variante |
+| `GET` | `/share-match/` | Alias der Übersichtsseite unter der alten URL: gleiche Karten wie `/share/`, Buttons teilen die `/share/{id}/`-Seiten |
+
+- Datenquelle: wannspieltbig `match_upcoming`-API (frisch pro Request, max. 20 Matches).
+- TBA-Matches (ohne `lineup_b`) bleiben in der Liste, Bild mit „TBA"-Platzhalter.
+- Absolute URLs nutzen `SHARE_BASE_URL` (Env, Default `https://roaringbot.casparsadenius.de`).
+- Logo-Fetch: direkter Abruf zuerst (imgur), images.weserv.nl-Proxy als Fallback (HLTV-CDN).
+
 ## Konsum durch das Dashboard
 
 - **Status (read-only):** Volume-Mount `./data:/data/roaringbot:ro` →

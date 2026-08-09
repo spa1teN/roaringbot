@@ -2816,10 +2816,14 @@ class EsportsCog(commands.Cog):
                 match.start_time > now):  # Match hasn't started yet
 
                 # Fire as close to exactly T-30 minutes as the 1-minute poll allows:
-                # a 1-minute window just below the 30-minute mark, so the reminder
-                # never goes out late and at most ~1 minute early.
+                # the preferred moment is a 1-minute window just below the 30-minute
+                # mark. The window is open for the whole last 30 minutes though, so a
+                # match that enters the API late (or a restart during the window)
+                # still gets its reminder — the health check flags reminder_missing
+                # for exactly this range (time_to_start <= 1800), and without the
+                # lower bound such matches would never be reminded.
                 time_to_start = (match.start_time - now).total_seconds()
-                if 1740 <= time_to_start <= 1800:  # 29-30 minutes
+                if 0 < time_to_start <= 1800:  # last 30 minutes, up to kickoff
                     await self._send_match_reminder(match, channel)
     
     REMINDER_PING_DELAY = 60  # seconds between reminder message and role ping

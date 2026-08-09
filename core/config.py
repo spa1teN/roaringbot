@@ -93,7 +93,12 @@ class BotConfig:
     @property
     def esports_api_url(self) -> str:
         return os.getenv("ESPORTS_API_URL", "https://wannspieltbig.de/api/match_upcoming/")
-    
+
+    # WhatsApp Share Pages
+    @property
+    def share_base_url(self) -> str:
+        return os.getenv("SHARE_BASE_URL", "https://roaringbot.casparsadenius.de")
+
     @property
     def esports_poll_interval_minutes(self) -> int:
         return int(os.getenv("ESPORTS_POLL_INTERVAL_MINUTES", "5"))
