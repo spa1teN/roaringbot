@@ -97,7 +97,7 @@ class BotConfig:
     # WhatsApp Share Pages
     @property
     def share_base_url(self) -> str:
-        return os.getenv("SHARE_BASE_URL", "https://roaringbot.casparsadenius.de")
+        return os.getenv("SHARE_BASE_URL", "https://bot.wannspieltbig.de")
 
     @property
     def esports_poll_interval_minutes(self) -> int:

@@ -38,3 +38,8 @@ data/.status-*
 # Editor
 .claude/
 core/#*#
+
+# media
+*logo.png
+*bg.png
+*bg.jpg

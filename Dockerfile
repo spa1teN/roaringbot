@@ -13,7 +13,9 @@ COPY cogs/ cogs/
 COPY core/ core/
 COPY db/ db/
 COPY scripts/ scripts/
-COPY resources/big.png resources/big_square.png resources/pb.png resources/
+COPY resources/big.png resources/big_square.png resources/pb.png resources/tba.png \
+     resources/cs-bg.jpg resources/lol-bg.jpg resources/tm-bg.jpg \
+     resources/cs-logo.png resources/lol-logo.png resources/tm-logo.png resources/
 
 EXPOSE 8080
 CMD ["python", "bot.py"]

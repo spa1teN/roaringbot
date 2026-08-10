@@ -15,6 +15,7 @@ from discord.ext import commands, tasks
 from core.config import config
 from core.http_client import http_client
 from core.status_reporter import status_reporter
+from core.share_pages import compose_versus_image
 import base64
 
 
@@ -262,113 +263,13 @@ CS_EMOTE = "<:cs:1416235161594499092>"
 GAME_EMOJI = {"cs": CS_EMOTE, "lol": "<:lol:1416235138307854416>", "tm": "🏎️"}
 
 
-VERSUS_SIZE = (1600, 800)  # 2:1 — fills the container width without towering
-VERSUS_PAD = 80
-EVENT_COVER_SIZE = (1600, 400)  # 4:1 — Discord event cover thumbnail
-EVENT_COVER_PAD = 40
-EVENT_COVER_SCALE = 0.7   # logos at 70 % of their box-fit size
-EVENT_COVER_SHIFT = 0.25  # fraction of half-width to shift each logo inward
-
-TBA_SIZE = 512  # square placeholder matching a typical logo resolution
-
-
-def _make_tba_placeholder() -> bytes:
-    """Generate a transparent square placeholder with large 'TBA' text.
-    Returned as PNG bytes so it slots into the existing compose pipeline as if
-    it were a fetched opponent logo.  The transparent background matches real
-    team logos, and the large text fills most of the 512 px canvas so it stays
-    readable even after the 70 % scale-down applied in the 4:1 event-cover
-    composition."""
-    from PIL import Image, ImageDraw, ImageFont
-
-    img = Image.new("RGBA", (TBA_SIZE, TBA_SIZE), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-
-    text = "TBA"
-    # DejaVu Sans Bold is installed via the Dockerfile (fonts-dejavu-core).
-    # Fall back to the tiny PIL default if unavailable for any reason.
-    try:
-        font = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size=200
-        )
-    except (OSError, IOError):
-        font = ImageFont.load_default()
-
-    bbox = draw.textbbox((0, 0), text, font=font)
-    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    draw.text(
-        ((TBA_SIZE - tw) // 2, (TBA_SIZE - th) // 2 - bbox[1]),
-        text,
-        fill=(200, 200, 200, 230),
-        font=font,
-    )
-
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
-
-
-def compose_versus_image(opponent_png: bytes) -> bytes:
-    """Composite the club logo (left half) and the opponent logo (right half)
-    onto one transparent 2:1 canvas for the reminder gallery."""
-    from PIL import Image
-
-    W, H = VERSUS_SIZE
-    canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    big = Image.open("resources/big.png").convert("RGBA")
-    opponent = Image.open(io.BytesIO(opponent_png)).convert("RGBA")
-
-    half = W // 2
-    box_w, box_h = half - 2 * VERSUS_PAD, H - 2 * VERSUS_PAD
-
-    def fit(img):
-        r = min(box_w / img.width, box_h / img.height)
-        return img.resize((max(1, int(img.width * r)), max(1, int(img.height * r))), Image.LANCZOS)
-
-    big_f, opp_f = fit(big), fit(opponent)
-    canvas.paste(big_f, (VERSUS_PAD + (box_w - big_f.width) // 2, (H - big_f.height) // 2), big_f)
-    canvas.paste(opp_f, (half + VERSUS_PAD + (box_w - opp_f.width) // 2, (H - opp_f.height) // 2), opp_f)
-
-    out = io.BytesIO()
-    canvas.save(out, format="PNG")
-    return out.getvalue()
-
-
-def compose_event_cover_image(opponent_png: bytes) -> bytes:
-    """Composite the club logo and opponent logo onto a 4:1 canvas for the
-    Discord event cover thumbnail — logos are smaller and pulled closer
-    together than the 2:1 reminder variant."""
-    from PIL import Image
-
-    W, H = EVENT_COVER_SIZE
-    canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    big = Image.open("resources/big.png").convert("RGBA")
-    opponent = Image.open(io.BytesIO(opponent_png)).convert("RGBA")
-
-    half = W // 2
-    box_w, box_h = half - 2 * EVENT_COVER_PAD, H - 2 * EVENT_COVER_PAD
-
-    def fit(img):
-        r = min(box_w / img.width, box_h / img.height) * EVENT_COVER_SCALE
-        return img.resize((max(1, int(img.width * r)), max(1, int(img.height * r))), Image.LANCZOS)
-
-    big_f, opp_f = fit(big), fit(opponent)
-    shift = int(half * EVENT_COVER_SHIFT)
-    # Left logo: in left half, shifted inward
-    canvas.paste(big_f, (EVENT_COVER_PAD + shift + (box_w - big_f.width) // 2, (H - big_f.height) // 2), big_f)
-    # Right logo: in right half, shifted inward
-    canvas.paste(opp_f, (half + EVENT_COVER_PAD - shift + (box_w - opp_f.width) // 2, (H - opp_f.height) // 2), opp_f)
-
-    out = io.BytesIO()
-    canvas.save(out, format="PNG")
-    return out.getvalue()
-
+EVENT_COVER_H = 400  # 4:1 — Discord event cover thumbnail height
 
 def build_reminder_view(match: "EsportsMatch", guild_id: Optional[int], mention: Optional[str] = None,
                         versus: bool = False) -> discord.ui.LayoutView:
     """CV2 reminder message: title with live countdown, link buttons
     (Voice → Discord event / wannspieltbig). With versus=True the gallery
-    shows the composed 2:1 both-logos image (attachment://versus.png),
+    shows the composed 2:1 both-logos image (attachment://versus.jpg),
     otherwise the club logo (attachment://big.png) plus the opponent's
     logo URL as separate tiles."""
     unix_ts = int(match.start_time.timestamp())
@@ -378,7 +279,7 @@ def build_reminder_view(match: "EsportsMatch", guild_id: Optional[int], mention:
 
     gallery = discord.ui.MediaGallery()
     if versus:
-        gallery.add_item(media="attachment://versus.png")
+        gallery.add_item(media="attachment://versus.jpg")
     else:
         gallery.add_item(media="attachment://big.png")
         if match.team_b_logo_url:
@@ -418,7 +319,7 @@ def build_cs_ping_view(match: "EsportsMatch", thread_id: int, guild_id: int,
 
     gallery = discord.ui.MediaGallery()
     if versus:
-        gallery.add_item(media="attachment://versus.png")
+        gallery.add_item(media="attachment://versus.jpg")
     else:
         gallery.add_item(media="attachment://big.png")
         if match.team_b_logo_url:
@@ -2831,18 +2732,33 @@ class EsportsCog(commands.Cog):
     async def _build_reminder_media(self, match: EsportsMatch) -> Optional[bytes]:
         """The composed 2:1 versus image for the reminder, or None when it
         can't be built (proxy failure for a known logo). A TBA placeholder is
-        generated when the opponent hasn't been announced yet, so the event is
-        created immediately and the cover is replaced once the real logo
-        arrives. The opponent logo is fetched through the images.weserv.nl
-        proxy because HLTV's CDN blocks server IPs; results are cached per
-        match so reschedule edits don't re-fetch."""
+        generated when the opponent hasn't been announced yet. Uses the same
+        game-background design as the WhatsApp share pages."""
+        bo_text = f"BO{match.bestof}" if match.bestof else ""
+        berlin_tz = pytz.timezone("Europe/Berlin")
+        match_berlin = match.start_time.astimezone(berlin_tz)
+        now_berlin = datetime.now(berlin_tz)
+        if match_berlin.date() == now_berlin.date():
+            time_str = f"Today {match_berlin.strftime('%H:%M')}"
+        elif match_berlin.date() == now_berlin.date() + timedelta(days=1):
+            time_str = f"Tomorrow {match_berlin.strftime('%H:%M')}"
+        else:
+            time_str = match_berlin.strftime("%d %b %H:%M")
+
+        compose_kwargs = dict(game=match.game, tournament=match.tournament_name,
+                              bo_text=bo_text, time_str=time_str)
+
         if not match.team_b_logo_url:
             if match.team_b == "TBA":
-                return await asyncio.to_thread(compose_versus_image, _make_tba_placeholder())
+                return await asyncio.to_thread(compose_versus_image, b"", **compose_kwargs)
             return None
+
+        # Cache key now includes game/tournament/bo/time since they affect the image
+        cache_sig = f"{match.team_b_logo_url}|{match.game}|{match.tournament_name}|{match.bestof}|{time_str}"
         cached = self._versus_cache.get(match.id)
-        if cached and cached[0] == match.team_b_logo_url:
+        if cached and cached[0] == cache_sig:
             return cached[1]
+
         try:
             proxy_url = (
                 "https://images.weserv.nl/?url="
@@ -2857,8 +2773,8 @@ class EsportsCog(commands.Cog):
                 logo_bytes = await response.read()
             finally:
                 await response.release()
-            versus = await asyncio.to_thread(compose_versus_image, logo_bytes)
-            self._versus_cache[match.id] = (match.team_b_logo_url, versus)
+            versus = await asyncio.to_thread(compose_versus_image, logo_bytes, **compose_kwargs)
+            self._versus_cache[match.id] = (cache_sig, versus)
             return versus
         except Exception as e:
             self.log.warning(f"Could not build versus image for match {match.id}: {e}")
@@ -2867,11 +2783,24 @@ class EsportsCog(commands.Cog):
     async def _build_event_cover_media(self, match: EsportsMatch) -> Optional[bytes]:
         """4:1 variant of the versus image for the Discord event cover.
         Same opponent-logo fetch + proxy as _build_reminder_media but uses
-        the event-cover composition (smaller logos, pulled closer). A TBA
-        placeholder is generated when the opponent isn't announced yet."""
+        the event-cover composition (game background, smaller logos)."""
+        bo_text = f"BO{match.bestof}" if match.bestof else ""
+        berlin_tz = pytz.timezone("Europe/Berlin")
+        match_berlin = match.start_time.astimezone(berlin_tz)
+        now_berlin = datetime.now(berlin_tz)
+        if match_berlin.date() == now_berlin.date():
+            time_str = f"Today {match_berlin.strftime('%H:%M')}"
+        elif match_berlin.date() == now_berlin.date() + timedelta(days=1):
+            time_str = f"Tomorrow {match_berlin.strftime('%H:%M')}"
+        else:
+            time_str = match_berlin.strftime("%d %b %H:%M")
+
+        compose_kwargs = dict(game=match.game, tournament=match.tournament_name,
+                              bo_text=bo_text, time_str=time_str)
+
         if not match.team_b_logo_url:
             if match.team_b == "TBA":
-                return await asyncio.to_thread(compose_event_cover_image, _make_tba_placeholder())
+                return await asyncio.to_thread(compose_versus_image, b"", h=EVENT_COVER_H, **compose_kwargs)
             return None
         try:
             proxy_url = (
@@ -2897,7 +2826,7 @@ class EsportsCog(commands.Cog):
                     await response.release()
             if logo_bytes is None:
                 return None
-            return await asyncio.to_thread(compose_event_cover_image, logo_bytes)
+            return await asyncio.to_thread(compose_versus_image, logo_bytes, h=EVENT_COVER_H, **compose_kwargs)
         except Exception as e:
             self.log.warning(f"Could not build event cover image for match {match.id}: {e}")
             return None
@@ -2935,7 +2864,7 @@ class EsportsCog(commands.Cog):
                 view = build_cs_ping_view(match, thread.id, guild_id, versus=versus)
 
                 if versus:
-                    file = discord.File(io.BytesIO(versus_bytes), filename="versus.png")
+                    file = discord.File(io.BytesIO(versus_bytes), filename="versus.jpg")
                 else:
                     file = discord.File("resources/big.png", filename="big.png")
 
@@ -2988,7 +2917,7 @@ class EsportsCog(commands.Cog):
 
             if message:
                 if versus_bytes is not None:
-                    attachment = discord.File(io.BytesIO(versus_bytes), filename="versus.png")
+                    attachment = discord.File(io.BytesIO(versus_bytes), filename="versus.jpg")
                 else:
                     attachment = discord.File("resources/big.png", filename="big.png")
                 await message.edit(view=view, attachments=[attachment])
@@ -3007,7 +2936,7 @@ class EsportsCog(commands.Cog):
                             )
                             if versus_bytes is not None:
                                 ping_attachment = discord.File(
-                                    io.BytesIO(versus_bytes), filename="versus.png"
+                                    io.BytesIO(versus_bytes), filename="versus.jpg"
                                 )
                             else:
                                 ping_attachment = discord.File(
@@ -3075,7 +3004,7 @@ class EsportsCog(commands.Cog):
             def reminder_file() -> discord.File:
                 # discord.File objects are single-use — build a fresh one per send
                 if versus:
-                    return discord.File(io.BytesIO(versus_bytes), filename="versus.png")
+                    return discord.File(io.BytesIO(versus_bytes), filename="versus.jpg")
                 return discord.File("resources/big.png", filename="big.png")
 
             # CS matches with large ping roles (>250 members) need the ping in the

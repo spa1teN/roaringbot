@@ -215,10 +215,10 @@ def create_app(bot: Any) -> web.Application:
     # /share-match/* publicly)
     app.router.add_get("/share/", handle_share_list)
     app.router.add_get(r"/share/{match_id:\d+}/", handle_share_match)
-    app.router.add_get(r"/share/{match_id:\d+}/image.png", handle_share_image)
+    app.router.add_get(r"/share/{match_id:\d+}/image.jpg", handle_share_image)
     # Old slug-based URLs keep working (301 to the id-based URL)
     app.router.add_get("/share/{slug}/", handle_share_slug_redirect)
-    app.router.add_get("/share/{slug}/image.png", handle_share_slug_redirect)
+    app.router.add_get("/share/{slug}/image.jpg", handle_share_slug_redirect)
     # Old-URL alias of the overview list (same page as /share/)
     app.router.add_get("/share-match/", handle_share_next_match)
 

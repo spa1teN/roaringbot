@@ -100,7 +100,9 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
 
 **30-Min-Reminder:**
 - Gefeuert im 29–30-Min-Fenster vor Kickoff. Forum-Thread mit Versus-Image
-  (`compose_versus_image`, 2:1, Pillow). Game-Role-Ping **30 s verzögert**
+  (`compose_versus_image` in `core/share_pages.py` — geteilte Funktion für
+  Discord und WhatsApp, 2:1, JPEG quality 85, game-spezifische Hintergründe,
+  Schlagschatten, CS-Dreieck-Overlays). Game-Role-Ping **30 s verzögert**
   (`REMINDER_PING_DELAY`) in separater Nachricht.
 - Opponent-Logo via images.weserv.nl-Proxy (HLTV-CDN blockt Server-IPs); Fallback:
   alte Two-Tile-Gallery.
@@ -121,8 +123,9 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
 Europe/Berlin). Wochenwechsel → alte löschen, neue posten. CV2 mit Club-Logo
 (`big_square.png`) und Tagesblöcken.
 
-**Event-Cover (4:1):** `_build_event_cover_media` → `compose_event_cover_image` —
-Club-Logo + Opponent-Logo auf 70 % Skalierung, enger zusammen als das 2:1-Reminder-Bild.
+**Event-Cover (4:1):** `_build_event_cover_media` → `compose_versus_image(..., h=400)` —
+gleiche geteilte Funktion wie der 2:1-Reminder, 1600×400, JPEG. Design-Elemente
+proportional skaliert (sf = 0.5).
 
 ### Geburtstage (birthday.py)
 
@@ -190,11 +193,12 @@ RoaringBot/
 ├── CLAUDE.md
 ├── DATA_INTERFACE.md      # API- und Status-JSON-Contract
 ├── Dockerfile / docker-compose.yml
-├── resources/             # big.png, big_square.png, pb.png
+├── resources/             # big.png, big_square.png, pb.png, tba.png,
+│                          #   cs/lol/tm-bg.jpg, cs/lol/tm-logo.png
 ├── cogs/                  # birthday.py, esports.py, feedback.py, finance.py, moderation.py
 ├── core/                  # api_server.py, config.py, status_reporter.py, colors.py,
 │                          #   http_client.py, timezone_util.py, cache_manager.py,
-│                          #   validation.py, mod_views.py
+│                          #   validation.py, mod_views.py, share_pages.py
 ├── db/                    # schema.sql, connection.py, repositories/
 ├── scripts/               # migrate_data.py (einmalig JSON→Postgres)
 ├── config/                # Credentials (gitignored)
