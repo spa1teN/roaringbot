@@ -350,7 +350,7 @@ Die Proxy-Endpoints sind analog zu den bestehenden Tausendsassa-Feedback-Routen
 
 Die öffentlichen Share-Seiten unter `bot.wannspieltbig.de` laufen seit
 2026-08 als **eigener Service** (`wannspieltbig-social-preview`, Repo
-`github.com/spa1teN/wannspieltbig-social-preview`) — nginx proxied den
+`github.com/RoaringBearsBIG/wannspieltbig-social-preview`) — nginx proxied den
 Subdomain direkt zu dessen Container. Routen-Vertrag siehe dessen
 `DATA_INTERFACE.md`.
 
