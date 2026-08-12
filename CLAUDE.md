@@ -100,8 +100,8 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
 
 **30-Min-Reminder:**
 - Gefeuert im 29–30-Min-Fenster vor Kickoff. Forum-Thread mit Versus-Image
-  (`compose_versus_image` in `core/share_pages.py` — geteilte Funktion für
-  Discord und WhatsApp, 2:1, JPEG quality 85, game-spezifische Hintergründe,
+  (`compose_versus_image` in `core/versus_image.py` — lokale reine
+  Bild-Komposition, 2:1, JPEG quality 85, game-spezifische Hintergründe,
   Schlagschatten, CS-Dreieck-Overlays). Game-Role-Ping **30 s verzögert**
   (`REMINDER_PING_DELAY`) in separater Nachricht.
 - Opponent-Logo via images.weserv.nl-Proxy (HLTV-CDN blockt Server-IPs); Fallback:
@@ -124,8 +124,10 @@ Europe/Berlin). Wochenwechsel → alte löschen, neue posten. CV2 mit Club-Logo
 (`big_square.png`) und Tagesblöcken.
 
 **Event-Cover (4:1):** `_build_event_cover_media` → `compose_versus_image(..., h=400)` —
-gleiche geteilte Funktion wie der 2:1-Reminder, 1600×400, JPEG. Design-Elemente
-proportional skaliert (sf = 0.5).
+gleiche Funktion wie der 2:1-Reminder, 1600×400, JPEG. Design: **nur** Hintergrund +
+beide Team-Logos (via `show_tournament=False, show_game_logo=False,
+show_info=False` — kein Turnier-Label, kein Game-Logo, kein BO/Datum/Zeit).
+Design-Elemente proportional skaliert (sf = 0.5).
 
 ### Geburtstage (birthday.py)
 
@@ -198,7 +200,7 @@ RoaringBot/
 ├── cogs/                  # birthday.py, esports.py, feedback.py, finance.py, moderation.py
 ├── core/                  # api_server.py, config.py, status_reporter.py, colors.py,
 │                          #   http_client.py, timezone_util.py, cache_manager.py,
-│                          #   validation.py, mod_views.py, share_pages.py
+│                          #   validation.py, mod_views.py, versus_image.py
 ├── db/                    # schema.sql, connection.py, repositories/
 ├── scripts/               # migrate_data.py (einmalig JSON→Postgres)
 ├── config/                # Credentials (gitignored)

@@ -348,26 +348,16 @@ Die Proxy-Endpoints sind analog zu den bestehenden Tausendsassa-Feedback-Routen
 
 ## WhatsApp Share Pages (öffentlich)
 
-Unter `bot.wannspieltbig.de` (nginx-proxied, **nur** `/share/*` wird
-öffentlich exponiert — alle anderen Pfade antworten 404, die Feedback-API
-bleibt intern) stellt der Bot öffentliche Share-Seiten für die
-WhatsApp-Channel-Bridge bereit. Implementiert in
-[`core/share_pages.py`](core/share_pages.py).
+Die öffentlichen Share-Seiten unter `bot.wannspieltbig.de` laufen seit
+2026-08 als **eigener Service** (`wannspieltbig-social-preview`, Repo
+`github.com/spa1teN/wannspieltbig-social-preview`) — nginx proxied den
+Subdomain direkt zu dessen Container. Routen-Vertrag siehe dessen
+`DATA_INTERFACE.md`.
 
-### Endpunkte
-
-| Methode | Pfad | Zweck |
-|---|---|---|
-| `GET` | `/` | Übersichtsseite: eine Karte pro kommendem Match mit „Share to WhatsApp"-Button (öffnet `wa.me/?text=<url>`) |
-| `GET` | `/{id}` | Match-Seite über Match-ID: `og:`-Tags für die WhatsApp-Link-Preview (Versus-Bild via `og:image`, `og:url` = wannspieltbig-Match-Seite), danach JS-Redirect auf `html_detail_url`. Funktioniert auch für beendete Matches |
-| `GET` | `/{id}/image.jpg` | Versus-JPEG (1600×800, 2:1, quality 85): Game-spezifischer Hintergrund, BIG- + Gegner-Logo mit Schlagschatten, Dreieck-Overlays (CS), Game-Logo + BO · Zeit unten-links, Turnier-Label (game-spezifische Position/Farbe). `Cache-Control: public, max-age=3600` |
-| `GET` | `/share/{id}/` · `/share/{id}/image.jpg` · `/share/{slug}/` · `/share/{slug}/image.jpg` | Kompatibilität: alte `/share/…`-URLs → werden weiterhin bedient (keine 301, um bestehende WhatsApp-Caches nicht zu invalidieren) |
-| `GET` | `/share-match/` | Alias der Übersichtsseite unter der alten URL |
-
-- Datenquelle: wannspieltbig `match_upcoming`-API (frisch pro Request, max. 20 Matches).
-- TBA-Matches (ohne `lineup_b`) bleiben in der Liste, Bild mit „TBA"-Platzhalter.
-- Absolute URLs nutzen `SHARE_BASE_URL` (Env, Default `https://bot.wannspieltbig.de`).
-- Logo-Fetch: direkter Abruf zuerst (imgur), images.weserv.nl-Proxy als Fallback (HLTV-CDN).
+RoaringBot behält nur die reine Bild-Komposition für Discord
+(`core/versus_image.py` — gespiegelt im Service als `image.py`; Änderungen
+müssen manuell in beide Richtungen nachgezogen werden) und den
+WhatsApp-Ping-Button (nutzt `SHARE_BASE_URL`).
 
 ## Konsum durch das Dashboard
 
