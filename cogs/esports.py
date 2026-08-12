@@ -15,7 +15,7 @@ from discord.ext import commands, tasks
 from core.config import config
 from core.http_client import http_client
 from core.status_reporter import status_reporter
-from core.share_pages import compose_versus_image
+from core.versus_image import compose_versus_image
 import base64
 
 
@@ -2780,7 +2780,7 @@ class EsportsCog(commands.Cog):
         row.add_item(discord.ui.Button(
             style=discord.ButtonStyle.link,
             label="Send WhatsApp Reminder",
-            url="https://bot.wannspieltbig.de/",
+            url=f"{config.share_base_url}/",
         ))
         container.add_item(row)
         view.add_item(container)
@@ -2847,7 +2847,9 @@ class EsportsCog(commands.Cog):
     async def _build_event_cover_media(self, match: EsportsMatch) -> Optional[bytes]:
         """4:1 variant of the versus image for the Discord event cover.
         Same opponent-logo fetch + proxy as _build_reminder_media but uses
-        the event-cover composition (game background, smaller logos)."""
+        the event-cover composition (game background, smaller logos).
+        Design: only background + both team logos (no game logo, no
+        tournament label, no BO/date/time)."""
         bo_text = f"BO{match.bestof}" if match.bestof else ""
         berlin_tz = pytz.timezone("Europe/Berlin")
         match_berlin = match.start_time.astimezone(berlin_tz)
@@ -2860,7 +2862,9 @@ class EsportsCog(commands.Cog):
             time_str = match_berlin.strftime("%d %b %H:%M")
 
         compose_kwargs = dict(game=match.game, tournament=match.tournament_name,
-                              bo_text=bo_text, time_str=time_str)
+                              bo_text=bo_text, time_str=time_str,
+                              show_tournament=False, show_game_logo=False,
+                              show_info=False)
 
         if not match.team_b_logo_url:
             if match.team_b == "TBA":
