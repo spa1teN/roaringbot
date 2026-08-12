@@ -129,6 +129,13 @@ beide Team-Logos (via `show_tournament=False, show_game_logo=False,
 show_info=False` — kein Turnier-Label, kein Game-Logo, kein BO/Datum/Zeit).
 Design-Elemente proportional skaliert (sf = 0.5).
 
+**Spiegel-Modul:** `core/versus_image.py` ist gespiegelt im Share-Page-Service
+[wannspieltbig-social-preview](https://github.com/RoaringBearsBIG/wannspieltbig-social-preview)
+(dort `image.py` — der Service liefert die öffentlichen `bot.wannspieltbig.de`-Seiten
+inkl. twitter:image-Variante). Änderungen an `compose_versus_image`/Loadern müssen
+manuell in beide Richtungen nachgezogen werden. Der WhatsApp-Ping-Button im
+Summary-Channel nutzt `config.share_base_url`.
+
 ### Geburtstage (birthday.py)
 
 - Task läuft um 08:00 **und** 09:00 UTC, handelt aber nur wenn es 10:00 in Berlin

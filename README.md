@@ -46,6 +46,11 @@
 > **[DATA_INTERFACE.md](DATA_INTERFACE.md)** — API and status JSON contract for dashboard consumers<br/>
 > **[CLAUDE.md](CLAUDE.md)** — detailed architecture, key invariants, and development guide
 
+> **Related**: the public share pages for wannspieltbig matches (WhatsApp/X link
+> previews behind `bot.wannspieltbig.de`) run as their own service —
+> [wannspieltbig-social-preview](https://github.com/RoaringBearsBIG/wannspieltbig-social-preview)
+> (extracted from this repo in 2026-08).
+
 ---
 ### Architecture
 
@@ -63,6 +68,8 @@ core/                 Business logic
   status_reporter.py  Atomic data/status.json writer (15 s interval)
   http_client.py      aiohttp pool with retry/backoff
   colors.py           Discord colour constants
+  versus_image.py     Pure versus-image composition for reminders/event covers
+                      (mirrored in wannspieltbig-social-preview as image.py)
 
 db/                   PostgreSQL via asyncpg, repository pattern
 resources/            Static images (logo.png, big.png, big_square.png, pb.png)
