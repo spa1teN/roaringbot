@@ -89,6 +89,7 @@ class EsportsMatch:
         self.reminder_message_id: Optional[int] = None
         self.forum_thread_id: Optional[int] = None
         self.ping_message_id: Optional[int] = None  # Summary-channel ping message (CS large-role workaround)
+        self.ping_text_message_id: Optional[int] = None  # Plain-text role ping preceding the CV2 ping card
     
     @property
     def event_name(self) -> str:
@@ -708,6 +709,7 @@ class EsportsCog(commands.Cog):
         self.reminder_to_match: Dict[int, int] = {}  # Reminder message ID -> match ID
         self.thread_to_match: Dict[int, int] = {}  # Forum thread ID -> match ID
         self.ping_to_match: Dict[int, int] = {}  # Ping message ID -> match ID (CS large-role workaround)
+        self.plain_ping_to_match: Dict[int, int] = {}  # Plain-text role ping message ID -> match ID
         self.event_start_failures: Dict[int, int] = {}  # event ID -> consecutive failure count
         self._first_poll_done: bool = False  # set after first successful poll post-startup
         self._versus_cache: Dict[int, Tuple[str, bytes]] = {}  # match ID -> (logo URL, composed PNG)
@@ -720,6 +722,7 @@ class EsportsCog(commands.Cog):
         self.monitored_matches: Set[int] = set()  # Matches currently being monitored for start time
         self._pending_tracker_restore: Dict[int, dict] = {}  # Loaded from DB, applied after first API poll
         self._livescore_finished_ids: Set[int] = set()  # Match IDs finished via livescore sync; skip health checks until they leave the API
+        self._whatsapp_ping_sent: Set[int] = set()  # Match IDs that already got the 45-min WhatsApp ping
 
         # German timezone for weekly summary scheduling
         self.germany_tz = pytz.timezone("Europe/Berlin")
@@ -742,10 +745,12 @@ class EsportsCog(commands.Cog):
             self.reminder_to_match = data["reminder_to_match"]
             self.thread_to_match = data["thread_to_match"]
             self.ping_to_match = data.get("ping_to_match", {})
+            self.plain_ping_to_match = data.get("plain_ping_to_match", {})
             self.summary_message_id = data["summary_message_id"]
             self.monitored_matches = set(data["monitored_matches"])
             self.known_match_ids = set(data["known_match_ids"])
             self._livescore_finished_ids = set(data.get("livescore_finished_ids", []))
+            self._whatsapp_ping_sent = set(data.get("whatsapp_ping_sent", []))
             self._pending_tracker_restore = {
                 int(k): v for k, v in data["active_cs_trackers"].items()
             }
@@ -779,11 +784,13 @@ class EsportsCog(commands.Cog):
                 reminder_to_match=self.reminder_to_match,
                 thread_to_match=self.thread_to_match,
                 ping_to_match=self.ping_to_match,
+                plain_ping_to_match=self.plain_ping_to_match,
                 summary_message_id=self.summary_message_id,
                 monitored_matches=self.monitored_matches,
                 known_match_ids=set(self.matches.keys()),
                 active_cs_trackers=active_cs_trackers,
                 livescore_finished_ids=self._livescore_finished_ids,
+                whatsapp_ping_sent=list(self._whatsapp_ping_sent),
             )
         except Exception as e:
             self.log.error(f"Error saving esports data: {e}")
@@ -979,6 +986,12 @@ class EsportsCog(commands.Cog):
                         match.ping_message_id = ping_id
                         break
 
+                # Restore plain-text role ping ID from stored mappings
+                for ping_text_id, stored_match_id in self.plain_ping_to_match.items():
+                    if stored_match_id == match.id:
+                        match.ping_text_message_id = ping_text_id
+                        break
+
                 current_matches[match.id] = match
             
             # Handle new, updated, and cancelled matches
@@ -1004,6 +1017,9 @@ class EsportsCog(commands.Cog):
 
             # Check for matches needing 30-minute reminders
             await self._check_for_match_reminders()
+
+            # Check for matches needing 45-min WhatsApp pings
+            await self._check_for_whatsapp_pings()
             
             # Check for reminder messages that should be cleaned up
             await self._check_for_reminder_cleanup()
@@ -2726,7 +2742,55 @@ class EsportsCog(commands.Cog):
                 time_to_start = (match.start_time - now).total_seconds()
                 if 0 < time_to_start <= 1800:  # last 30 minutes, up to kickoff
                     await self._send_match_reminder(match, channel)
-    
+
+    async def _check_for_whatsapp_pings(self):
+        """Send a small WhatsApp-reminder card 45 min before each match
+        to the configured PING_WHATSAPP channel."""
+        channel_id = config.ping_whatsapp_channel_id
+        if not channel_id:
+            return
+
+        channel = self.bot.get_channel(channel_id)
+        if not channel:
+            return
+
+        now = datetime.now(timezone.utc)
+
+        for match in self.matches.values():
+            if match.cancelled or match.id in self._whatsapp_ping_sent:
+                continue
+            if match.start_time <= now:
+                continue
+
+            time_to_start = (match.start_time - now).total_seconds()
+            # Fire in the 44–45 min window before kickoff.  The window stays
+            # open for the full 45 min so a late-arriving match or a restart
+            # still gets its ping.
+            if 0 < time_to_start <= 2700:  # last 45 minutes
+                await self._send_whatsapp_ping(match, channel)
+
+    async def _send_whatsapp_ping(self, match: EsportsMatch, channel):
+        """Post a minimal CV2 card: title line + URL button to the share page."""
+        view = discord.ui.LayoutView(timeout=None)
+        container = discord.ui.Container(accent_colour=discord.Colour(0x25D366))
+        container.add_item(discord.ui.TextDisplay(
+            f"## BIG vs. {match.team_b} in 45 min"
+        ))
+        row = discord.ui.ActionRow()
+        row.add_item(discord.ui.Button(
+            style=discord.ButtonStyle.link,
+            label="Send WhatsApp Reminder",
+            url="https://bot.wannspieltbig.de/",
+        ))
+        container.add_item(row)
+        view.add_item(container)
+        try:
+            await channel.send(view=view)
+            self._whatsapp_ping_sent.add(match.id)
+            self.log.info(f"WhatsApp ping sent for match {match.id} ({match.event_name})")
+        except Exception as e:
+            self.log.error(f"Failed to send WhatsApp ping for match {match.id}: {e}")
+
     REMINDER_PING_DELAY = 60  # seconds between reminder message and role ping
 
     async def _build_reminder_media(self, match: EsportsMatch) -> Optional[bytes]:
@@ -2854,10 +2918,12 @@ class EsportsCog(commands.Cog):
                 versus = versus_bytes is not None
 
                 # 1) Plain-text role ping — triggers push notifications
-                await summary_channel.send(
+                plain_ping_msg = await summary_channel.send(
                     content=mention_text,
                     allowed_mentions=discord.AllowedMentions(roles=True),
                 )
+                match.ping_text_message_id = plain_ping_msg.id
+                self.plain_ping_to_match[plain_ping_msg.id] = match_id
 
                 # 2) CV2 card — same design as the thread reminder but with
                 #    a single "Match Thread" link button
@@ -3144,6 +3210,9 @@ class EsportsCog(commands.Cog):
                 stale_ping_ids = [pid for pid, mid in self.ping_to_match.items() if mid == match_id]
                 for pid in stale_ping_ids:
                     del self.ping_to_match[pid]
+                stale_plain_ping_ids = [pid for pid, mid in self.plain_ping_to_match.items() if mid == match_id]
+                for pid in stale_plain_ping_ids:
+                    del self.plain_ping_to_match[pid]
             else:
                 # No thread — delete the channel message
                 try:
@@ -3175,6 +3244,20 @@ class EsportsCog(commands.Cog):
                 if match.ping_message_id in self.ping_to_match:
                     del self.ping_to_match[match.ping_message_id]
                 match.ping_message_id = None
+
+            # Delete the plain-text role ping sent right before the ping card
+            if match and match.ping_text_message_id:
+                try:
+                    plain_ping_msg = await channel.fetch_message(match.ping_text_message_id)
+                    await plain_ping_msg.delete()
+                    self.log.info(f"Deleted plain ping message {match.ping_text_message_id}")
+                except discord.NotFound:
+                    self.log.debug(f"Plain ping message {match.ping_text_message_id} already deleted")
+                except Exception as e:
+                    self.log.warning(f"Failed to delete plain ping message {match.ping_text_message_id}: {e}")
+                if match.ping_text_message_id in self.plain_ping_to_match:
+                    del self.plain_ping_to_match[match.ping_text_message_id]
+                match.ping_text_message_id = None
 
         if reminders_to_delete:
             await self._save_data()
@@ -3226,6 +3309,23 @@ class EsportsCog(commands.Cog):
             if match.ping_message_id in self.ping_to_match:
                 del self.ping_to_match[match.ping_message_id]
             match.ping_message_id = None
+
+        # Delete the plain-text role ping sent right before the ping card
+        if match.ping_text_message_id:
+            try:
+                if config.esports_summary_channel_id:
+                    ch = self.bot.get_channel(config.esports_summary_channel_id)
+                    if ch:
+                        msg = await ch.fetch_message(match.ping_text_message_id)
+                        await msg.delete()
+                        self.log.info(f"Deleted plain ping message {match.ping_text_message_id} for match {match.id}")
+            except discord.NotFound:
+                self.log.debug(f"Plain ping message {match.ping_text_message_id} already deleted")
+            except Exception as e:
+                self.log.warning(f"Failed to delete plain ping message {match.ping_text_message_id}: {e}")
+            if match.ping_text_message_id in self.plain_ping_to_match:
+                del self.plain_ping_to_match[match.ping_text_message_id]
+            match.ping_text_message_id = None
 
         await self._save_data()
     

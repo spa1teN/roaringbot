@@ -24,20 +24,24 @@ class EsportsRepository(BaseRepository):
         reminder_rows = await self.fetch("SELECT reminder_id, match_id FROM esports_reminder_map")
         thread_rows = await self.fetch("SELECT thread_id, match_id FROM esports_thread_map")
         ping_rows = await self.fetch("SELECT ping_id, match_id FROM esports_ping_map")
+        plain_ping_rows = await self.fetch("SELECT ping_text_id, match_id FROM esports_plain_ping_map")
         known_rows = await self.fetch("SELECT match_id, monitored FROM esports_known_matches")
         tracker_rows = await self.fetch("SELECT * FROM cs_trackers")
         summary_row = await self.fetchrow("SELECT value FROM esports_state WHERE key = 'summary_message_id'")
         finished_row = await self.fetchrow("SELECT value FROM esports_state WHERE key = 'livescore_finished_ids'")
+        wa_ping_row = await self.fetchrow("SELECT value FROM esports_state WHERE key = 'whatsapp_ping_sent'")
 
         return {
             "event_to_match": {r["event_id"]: r["match_id"] for r in event_rows},
             "reminder_to_match": {r["reminder_id"]: r["match_id"] for r in reminder_rows},
             "thread_to_match": {r["thread_id"]: r["match_id"] for r in thread_rows},
             "ping_to_match": {r["ping_id"]: r["match_id"] for r in ping_rows},
+            "plain_ping_to_match": {r["ping_text_id"]: r["match_id"] for r in plain_ping_rows},
             "summary_message_id": (json.loads(summary_row["value"]) if summary_row else None),
             "monitored_matches": [r["match_id"] for r in known_rows if r["monitored"]],
             "known_match_ids": [r["match_id"] for r in known_rows],
             "livescore_finished_ids": (json.loads(finished_row["value"]) if finished_row else []),
+            "whatsapp_ping_sent": (json.loads(wa_ping_row["value"]) if wa_ping_row else []),
             "active_cs_trackers": {
                 str(r["match_id"]): {
                     "message_id": r["message_id"],
@@ -64,6 +68,8 @@ class EsportsRepository(BaseRepository):
         known_match_ids: Set[int],
         active_cs_trackers: Dict[int, dict],
         livescore_finished_ids: Set[int] = None,
+        whatsapp_ping_sent: List[int] = None,
+        plain_ping_to_match: Dict[int, int] = None,
     ) -> None:
         """Bulk-resync all E-Sports state (full replace, matches the old
         write-everything-at-once JSON semantics)."""
@@ -97,6 +103,13 @@ class EsportsRepository(BaseRepository):
                         list(ping_to_match.items()),
                     )
 
+                await conn.execute("DELETE FROM esports_plain_ping_map")
+                if plain_ping_to_match:
+                    await conn.executemany(
+                        "INSERT INTO esports_plain_ping_map (ping_text_id, match_id) VALUES ($1, $2)",
+                        list(plain_ping_to_match.items()),
+                    )
+
                 await conn.execute(
                     """INSERT INTO esports_state (key, value) VALUES ('summary_message_id', $1)
                        ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""",
@@ -107,6 +120,12 @@ class EsportsRepository(BaseRepository):
                     """INSERT INTO esports_state (key, value) VALUES ('livescore_finished_ids', $1)
                        ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""",
                     json.dumps(list(livescore_finished_ids) if livescore_finished_ids else []),
+                )
+
+                await conn.execute(
+                    """INSERT INTO esports_state (key, value) VALUES ('whatsapp_ping_sent', $1)
+                       ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""",
+                    json.dumps(list(whatsapp_ping_sent) if whatsapp_ping_sent else []),
                 )
 
                 await conn.execute("DELETE FROM esports_known_matches")

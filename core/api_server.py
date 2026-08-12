@@ -211,15 +211,23 @@ def create_app(bot: Any) -> web.Application:
     app.router.add_get("/api/feedback/unread-count", handle_unread_count)
     app.router.add_get("/api/bot/avatar", handle_bot_avatar)
 
-    # Public WhatsApp-share pages (nginx exposes only /share/* and
-    # /share-match/* publicly)
+    # Public WhatsApp-share pages — canonical URLs are short:
+    #   bot.wannspieltbig.de/           → match list
+    #   bot.wannspieltbig.de/{id}        → match page (og: tags + JS redirect)
+    #   bot.wannspieltbig.de/{id}/image.jpg → versus thumbnail
+    # Old /share/… and /share-match/ routes are kept for backward compat
+    # with already-shared WhatsApp messages.
+    app.router.add_get("/", handle_share_list)
+    app.router.add_get(r"/{match_id:\d+}", handle_share_match)
+    app.router.add_get(r"/{match_id:\d+}/image.jpg", handle_share_image)
+    # Legacy /share/… URLs (still served, canonical ones are above)
     app.router.add_get("/share/", handle_share_list)
     app.router.add_get(r"/share/{match_id:\d+}/", handle_share_match)
     app.router.add_get(r"/share/{match_id:\d+}/image.jpg", handle_share_image)
     # Old slug-based URLs keep working (301 to the id-based URL)
     app.router.add_get("/share/{slug}/", handle_share_slug_redirect)
     app.router.add_get("/share/{slug}/image.jpg", handle_share_slug_redirect)
-    # Old-URL alias of the overview list (same page as /share/)
+    # Old-URL alias of the overview list (same page as /)
     app.router.add_get("/share-match/", handle_share_next_match)
 
     return app

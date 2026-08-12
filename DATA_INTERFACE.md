@@ -358,11 +358,11 @@ WhatsApp-Channel-Bridge bereit. Implementiert in
 
 | Methode | Pfad | Zweck |
 |---|---|---|
-| `GET` | `/share/` | Übersichtsseite: eine Karte pro kommendem Match mit „Share to WhatsApp"-Button (teilt Match-Infos als Klartext + Match-URL) |
-| `GET` | `/share/{id}/` | Match-Seite über Match-ID: `og:`-Tags für die WhatsApp-Link-Preview (Versus-Bild via `og:image`, `og:url` = wannspieltbig-Match-Seite), danach Meta-Refresh + JS-Redirect auf `html_detail_url`. Funktioniert auch für beendete Matches |
-| `GET` | `/share/{id}/image.jpg` | Versus-JPEG (1600×800, 2:1, quality 85): Game-spezifischer Hintergrund, BIG- + Gegner-Logo mit Schlagschatten, Dreieck-Overlays (CS), Game-Logo + BO · Zeit unten-links, Turnier-Label (game-spezifische Position/Farbe). `Cache-Control: public, max-age=3600`. Wird serverseitig gecacht, Key = Slug + Opponent-URL + Kickoff-Time + Tournament |
-| `GET` | `/share/{slug}/` · `/share/{slug}/image.jpg` | Kompatibilität: alte Slug-URLs → 301 auf die ID-Variante |
-| `GET` | `/share-match/` | Alias der Übersichtsseite unter der alten URL: gleiche Karten wie `/share/`, Buttons teilen die `/share/{id}/`-Seiten |
+| `GET` | `/` | Übersichtsseite: eine Karte pro kommendem Match mit „Share to WhatsApp"-Button (öffnet `wa.me/?text=<url>`) |
+| `GET` | `/{id}` | Match-Seite über Match-ID: `og:`-Tags für die WhatsApp-Link-Preview (Versus-Bild via `og:image`, `og:url` = wannspieltbig-Match-Seite), danach JS-Redirect auf `html_detail_url`. Funktioniert auch für beendete Matches |
+| `GET` | `/{id}/image.jpg` | Versus-JPEG (1600×800, 2:1, quality 85): Game-spezifischer Hintergrund, BIG- + Gegner-Logo mit Schlagschatten, Dreieck-Overlays (CS), Game-Logo + BO · Zeit unten-links, Turnier-Label (game-spezifische Position/Farbe). `Cache-Control: public, max-age=3600` |
+| `GET` | `/share/{id}/` · `/share/{id}/image.jpg` · `/share/{slug}/` · `/share/{slug}/image.jpg` | Kompatibilität: alte `/share/…`-URLs → werden weiterhin bedient (keine 301, um bestehende WhatsApp-Caches nicht zu invalidieren) |
+| `GET` | `/share-match/` | Alias der Übersichtsseite unter der alten URL |
 
 - Datenquelle: wannspieltbig `match_upcoming`-API (frisch pro Request, max. 20 Matches).
 - TBA-Matches (ohne `lineup_b`) bleiben in der Liste, Bild mit „TBA"-Platzhalter.

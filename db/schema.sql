@@ -71,6 +71,13 @@ CREATE TABLE IF NOT EXISTS esports_ping_map (
 );
 CREATE INDEX IF NOT EXISTS idx_esports_ping_map_match ON esports_ping_map(match_id);
 
+-- Plain-text role ping ID -> match ID (sent right before the CV2 ping card in the summary channel)
+CREATE TABLE IF NOT EXISTS esports_plain_ping_map (
+    ping_text_id    BIGINT PRIMARY KEY,
+    match_id        BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_esports_plain_ping_map_match ON esports_plain_ping_map(match_id);
+
 -- Matches already seen, to avoid duplicate Discord events on restart, plus
 -- whether a CS score tracker has already been (or should be) started for it.
 CREATE TABLE IF NOT EXISTS esports_known_matches (

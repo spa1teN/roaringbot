@@ -161,6 +161,11 @@ class BotConfig:
         role_id = os.getenv("PING_TM")
         return int(role_id) if role_id else None
 
+    @property
+    def ping_whatsapp_channel_id(self) -> Optional[int]:
+        channel_id = os.getenv("PING_WHATSAPP")
+        return int(channel_id) if channel_id else None
+
     def _validate_required_env_vars(self):
         """Validate that required environment variables are set"""
         required_vars = ["DISCORD_TOKEN"]
