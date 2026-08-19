@@ -1507,7 +1507,11 @@ class EsportsCog(commands.Cog):
 
         time_to_start = (match.start_time - now).total_seconds()
         reminder_ok = bool(match.reminder_message_id or match.forum_thread_id)
-        if time_to_start <= 1800 and not reminder_ok:
+        # Only flag while the match is still upcoming (0..30 min before kickoff),
+        # matching the sender's window in _check_for_match_reminders. Without the
+        # lower bound, matches that already started but linger in the API would be
+        # flagged forever — the sender never re-reminds a started match.
+        if 0 < time_to_start <= 1800 and not reminder_ok:
             issues.append("reminder_missing")
 
         if match.discord_event_id and now >= self._event_start_trigger(match):
@@ -2736,9 +2740,9 @@ class EsportsCog(commands.Cog):
                 # the preferred moment is a 1-minute window just below the 30-minute
                 # mark. The window is open for the whole last 30 minutes though, so a
                 # match that enters the API late (or a restart during the window)
-                # still gets its reminder — the health check flags reminder_missing
-                # for exactly this range (time_to_start <= 1800), and without the
-                # lower bound such matches would never be reminded.
+                # still gets its reminder. The health check flags reminder_missing
+                # for exactly this same window (0 < time_to_start <= 1800) — already
+                # started matches are never re-reminded and must not be flagged.
                 time_to_start = (match.start_time - now).total_seconds()
                 if 0 < time_to_start <= 1800:  # last 30 minutes, up to kickoff
                     await self._send_match_reminder(match, channel)
