@@ -152,6 +152,8 @@ diese Sektion. `counters`-Objekte liefern rollierende Zählungen der letzten
                                                   // map_name kann null sein, solange die Map noch nicht feststeht → Anzeige fällt auf "Map N" zurück
         // issues: leer wenn alles ok, sonst eine Teilmenge von:
         // "no_discord_event" | "reminder_missing" | "event_not_started" | "tracking_missing" (nur CS)
+        // reminder_missing wird NUR im 0-30-Min-Fenster vor Kickoff geflaggt (0 < time_to_start <= 1800);
+        // bereits gestartete Matches werden nie als reminder_missing alarmiert.
         // jedes erkannte Issue wird zusätzlich als log.error geloggt (taucht im Fehler-Log-Graphen auf)
         "issues": []
       }

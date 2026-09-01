@@ -97,6 +97,11 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
   `_livescore_finished_ids`
 - `voice_event_ok`, `reminder_ok`, `tracking_ok`: Timeline-basierte Health-Checks
 - `issues`: Von `_match_health_issues()` — immer leer für Livescore-beendete Matches
+- `reminder_missing` wird **nur im 0–30-Min-Fenster vor Kickoff** geflaggt
+  (`0 < time_to_start <= 1800` — identisch zum Reminder-Sender). Ohne die untere
+  Grenze wurden bereits gestartete, aber noch in der API verweilende Matches
+  (nach Cleanup der Reminder bei start+4h) bis zum Verlassen der API fälschlich
+  alarmiert (Aug-19-Storm).
 
 **30-Min-Reminder:**
 - Gefeuert im 29–30-Min-Fenster vor Kickoff. Forum-Thread mit Versus-Image
@@ -121,13 +126,21 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
 
 **Weekly Summary:** Eine durchgehend editierte Nachricht pro Woche (Mo–So
 Europe/Berlin). Wochenwechsel → alte löschen, neue posten. CV2 mit Club-Logo
-(`big_square.png`) und Tagesblöcken.
+(`big_square.png`) und Tagesblöcken. **Nur noch zukünftige Matches** werden
+gelistet — Matches, deren `start_time` bereits in der Vergangenheit liegt
+(= gespielt), fallen aus der Anzeige.
 
-**Event-Cover (4:1):** `_build_event_cover_media` → `compose_versus_image(..., h=400)` —
-gleiche Funktion wie der 2:1-Reminder, 1600×400, JPEG. Design: **nur** Hintergrund +
-beide Team-Logos (via `show_tournament=False, show_game_logo=False,
-show_info=False` — kein Turnier-Label, kein Game-Logo, kein BO/Datum/Zeit).
-Design-Elemente proportional skaliert (sf = 0.5).
+**Event-Cover (2.5:1):** `_build_event_cover_media` → `compose_versus_image(..., h=640)` —
+1600×640, JPEG. Design: **nur** Hintergrund + beide Team-Logos (via
+`show_tournament=False, show_game_logo=False, show_info=False` — kein
+Turnier-Label, kein Game-Logo, kein BO/Datum/Zeit). Design-Elemente
+proportional skaliert (sf = 0.8).
+Das Seitenverhältnis ist load-bearing: Discord zeigt Event-Cover im
+Event-Header mit ~2.5:1 (800×320) — die 4:1-Variante (1600×400) wurde dort
+verzerrt. Bei einer Cover-Kompositions-Änderung `EVENT_COVER_VERSION` bumpen;
+`_reconcile_event_covers` lädt dann einmalig alle bestehenden Scheduled-Event-
+Cover neu hoch (persistiert in `esports_state.event_cover_version`), sonst
+würden Events mit stabilen Metadaten das alte Cover behalten.
 
 **Spiegel-Modul:** `core/versus_image.py` ist gespiegelt im Share-Page-Service
 [wannspieltbig-social-preview](https://github.com/RoaringBearsBIG/wannspieltbig-social-preview)

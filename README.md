@@ -93,7 +93,7 @@ logs/		          Logs with 30-day retention
 
 ### 1. Clone the repo and configure environment:
 ```bash
-git clone https://github.com/RoaringBearsBIG/roaringbot.git
+git clone https://github.com/RoaringBearsBIG/RoaringBot.git
 cd RoaringBot
 cp .env.example .env
 ```
