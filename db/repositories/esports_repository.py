@@ -30,6 +30,7 @@ class EsportsRepository(BaseRepository):
         summary_row = await self.fetchrow("SELECT value FROM esports_state WHERE key = 'summary_message_id'")
         finished_row = await self.fetchrow("SELECT value FROM esports_state WHERE key = 'livescore_finished_ids'")
         wa_ping_row = await self.fetchrow("SELECT value FROM esports_state WHERE key = 'whatsapp_ping_sent'")
+        cover_ver_row = await self.fetchrow("SELECT value FROM esports_state WHERE key = 'event_cover_version'")
 
         return {
             "event_to_match": {r["event_id"]: r["match_id"] for r in event_rows},
@@ -42,6 +43,7 @@ class EsportsRepository(BaseRepository):
             "known_match_ids": [r["match_id"] for r in known_rows],
             "livescore_finished_ids": (json.loads(finished_row["value"]) if finished_row else []),
             "whatsapp_ping_sent": (json.loads(wa_ping_row["value"]) if wa_ping_row else []),
+            "event_cover_version": (json.loads(cover_ver_row["value"]) if cover_ver_row else 0),
             "active_cs_trackers": {
                 str(r["match_id"]): {
                     "message_id": r["message_id"],
@@ -70,6 +72,7 @@ class EsportsRepository(BaseRepository):
         livescore_finished_ids: Set[int] = None,
         whatsapp_ping_sent: List[int] = None,
         plain_ping_to_match: Dict[int, int] = None,
+        event_cover_version: int = 0,
     ) -> None:
         """Bulk-resync all E-Sports state (full replace, matches the old
         write-everything-at-once JSON semantics)."""
@@ -126,6 +129,12 @@ class EsportsRepository(BaseRepository):
                     """INSERT INTO esports_state (key, value) VALUES ('whatsapp_ping_sent', $1)
                        ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""",
                     json.dumps(list(whatsapp_ping_sent) if whatsapp_ping_sent else []),
+                )
+
+                await conn.execute(
+                    """INSERT INTO esports_state (key, value) VALUES ('event_cover_version', $1)
+                       ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""",
+                    json.dumps(event_cover_version),
                 )
 
                 await conn.execute("DELETE FROM esports_known_matches")

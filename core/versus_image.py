@@ -48,10 +48,8 @@ def compose_versus_image(opponent_png: bytes, *, game: str, tournament: str,
     band_top = h - text_h
     dy = int(w * math.tan(math.radians(10)))
 
-    # Background
-    canvas = _load_background(game)
-    if (w, h) != (W, H):
-        canvas = canvas.resize((w, h), Image.LANCZOS)
+    # Background — cover-cropped to the target aspect ratio, never stretched
+    canvas = _cover_resize(_load_background(game), w, h)
 
     # Team logos
     big = _crop_visible(_load_club_logo())
@@ -190,16 +188,28 @@ def _load_club_logo() -> Image.Image:
 
 
 def _load_background(game: str) -> Image.Image:
-    """Load and resize the game-specific background. Falls back to dark solid."""
+    """Load the game-specific background at native resolution. Falls back to
+    dark solid. Callers must cover-crop (never stretch) to the target size."""
     path = GAME_BG.get(game)
     if path:
         try:
-            bg = Image.open(path).convert("RGBA")
-            return bg.resize((W, H), Image.LANCZOS)
+            return Image.open(path).convert("RGBA")
         except Exception:
             log.warning("versus: background load failed for %s, using fallback", game)
     canvas = Image.new("RGBA", (W, H), (16, 16, 16, 255))
     return canvas
+
+
+def _cover_resize(img: Image.Image, w: int, h: int) -> Image.Image:
+    """Scale img to fully cover (w, h) preserving aspect ratio, then
+    center-crop. Keeps the whole image undistorted — the overflow is cropped
+    instead of being squeezed into the target ratio."""
+    scale = max(w / img.width, h / img.height)
+    nw, nh = max(1, round(img.width * scale)), max(1, round(img.height * scale))
+    img = img.resize((nw, nh), Image.LANCZOS)
+    left = (nw - w) // 2
+    top = (nh - h) // 2
+    return img.crop((left, top, left + w, top + h))
 
 
 def _load_game_logo(game: str) -> Image.Image | None:

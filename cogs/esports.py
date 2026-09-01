@@ -264,7 +264,8 @@ CS_EMOTE = "<:cs:1416235161594499092>"
 GAME_EMOJI = {"cs": CS_EMOTE, "lol": "<:lol:1416235138307854416>", "tm": "🏎️"}
 
 
-EVENT_COVER_H = 400  # 4:1 — Discord event cover thumbnail height
+EVENT_COVER_H = 640  # 1600×640 = 2.5:1 — Discord event header shows covers at ~2.5:1 (800×320)
+EVENT_COVER_VERSION = 3  # bump when the cover composition changes → one-time re-upload of all scheduled events
 
 def build_reminder_view(match: "EsportsMatch", guild_id: Optional[int], mention: Optional[str] = None,
                         versus: bool = False) -> discord.ui.LayoutView:
@@ -716,6 +717,7 @@ class EsportsCog(commands.Cog):
         self.event_not_found_count: Dict[int, int] = {}  # event ID -> consecutive NotFound count
         self._event_status_by_match: Dict[int, discord.EventStatus] = {}  # match ID -> last observed Discord event status (this poll)
         self.summary_message_id: Optional[int] = None  # Latest summary message ID
+        self._event_cover_version: int = 0  # persisted; reconciled covers re-uploaded when < EVENT_COVER_VERSION
 
         # CS game tracking
         self.active_cs_games: Dict[int, CSGameTracker] = {}  # match ID -> tracker
@@ -751,6 +753,7 @@ class EsportsCog(commands.Cog):
             self.known_match_ids = set(data["known_match_ids"])
             self._livescore_finished_ids = set(data.get("livescore_finished_ids", []))
             self._whatsapp_ping_sent = set(data.get("whatsapp_ping_sent", []))
+            self._event_cover_version = data.get("event_cover_version", 0)
             self._pending_tracker_restore = {
                 int(k): v for k, v in data["active_cs_trackers"].items()
             }
@@ -791,6 +794,7 @@ class EsportsCog(commands.Cog):
                 active_cs_trackers=active_cs_trackers,
                 livescore_finished_ids=self._livescore_finished_ids,
                 whatsapp_ping_sent=list(self._whatsapp_ping_sent),
+                event_cover_version=self._event_cover_version,
             )
         except Exception as e:
             self.log.error(f"Error saving esports data: {e}")
@@ -1005,6 +1009,7 @@ class EsportsCog(commands.Cog):
             if not self._first_poll_done:
                 self._first_poll_done = True
                 await self._reconcile_all_reminders(current_matches)
+                await self._reconcile_event_covers(current_matches)
 
             # Check for CS matches starting soon
             await self._check_for_starting_matches()
@@ -2093,7 +2098,8 @@ class EsportsCog(commands.Cog):
             
             upcoming_matches = [
                 match for match in self.matches.values()
-                if not match.cancelled and week_start_utc <= match.start_time < week_end_utc
+                if not match.cancelled and match.start_time > now
+                and week_start_utc <= match.start_time < week_end_utc
             ]
             
             # Sort by start time
@@ -2199,7 +2205,8 @@ class EsportsCog(commands.Cog):
             
             upcoming_matches = [
                 match for match in self.matches.values()
-                if not match.cancelled and week_start_utc <= match.start_time < week_end_utc
+                if not match.cancelled and match.start_time > now
+                and week_start_utc <= match.start_time < week_end_utc
             ]
             
             # Sort by start time
@@ -2422,6 +2429,58 @@ class EsportsCog(commands.Cog):
             return (self._VC_BLOCKED, None)
 
         return (other_channel, other_label)
+
+    async def _reconcile_event_covers(self, current_matches: dict):
+        """After a cover-composition change (EVENT_COVER_VERSION bump), re-upload
+        the cover image for every existing scheduled event whose match is still
+        tracked.  The normal update path only refreshes the cover when match
+        metadata changes, so events with stable metadata would otherwise keep
+        the old rendering forever.  Runs once per version bump; no-op afterwards."""
+        if self._event_cover_version >= EVENT_COVER_VERSION:
+            return
+
+        guild = None
+        if config.esports_guild_id:
+            guild = self.bot.get_guild(config.esports_guild_id)
+        elif self.bot.guilds:
+            guild = self.bot.guilds[0]
+        if not guild:
+            self.log.warning("Cover reconciliation skipped — no guild resolved")
+            return
+
+        updated = skipped = failed = 0
+        for match in current_matches.values():
+            if match.cancelled or not match.discord_event_id:
+                continue
+            try:
+                event = await guild.fetch_scheduled_event(match.discord_event_id)
+            except discord.NotFound:
+                continue  # handled by the normal event-missing path
+            except Exception as e:
+                self.log.warning(f"Cover reconcile: fetch event {match.discord_event_id} failed: {e}")
+                failed += 1
+                continue
+            if event.status != discord.EventStatus.scheduled:
+                skipped += 1
+                continue
+            cover_bytes = await self._build_event_cover_media(match)
+            if cover_bytes is None:
+                skipped += 1
+                continue
+            try:
+                await event.edit(image=cover_bytes)
+                updated += 1
+            except Exception as e:
+                self.log.warning(f"Cover reconcile: edit event {event.id} for match {match.id} failed: {e}")
+                failed += 1
+
+        if failed == 0:
+            self._event_cover_version = EVENT_COVER_VERSION
+            await self._save_data()
+        self.log.info(
+            f"Event cover reconciliation (v{EVENT_COVER_VERSION}): "
+            f"updated {updated}, skipped {skipped}, failed {failed}"
+        )
 
     async def _reconcile_all_reminders(self, current_matches: dict):
         """After a restart, bring all existing reminders/pings/threads in sync
