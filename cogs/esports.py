@@ -111,11 +111,11 @@ class EsportsMatch:
         else:
             game_emoji = "🎮"
         
-        hltv_line = f"\n🔗  [HLTV]({self.hltv_url})" if self.game == "cs" and self.hltv_url else ""
+        hltv_link = f" • 🔗 [HLTV]({self.hltv_url})" if self.game == "cs" and self.hltv_url else ""
         return (
             f"🏆  **{self.tournament_name}**\n\n"
             f"{game_emoji}  {game_name} - BO{self.bestof}\n\n"
-            f"[wannspieltbig]({self.detail_url}){hltv_line}\n\n"
+            f"[wannspieltbig]({self.detail_url}){hltv_link}\n\n"
         )
     
     def __eq__(self, other):
@@ -257,8 +257,9 @@ class CSGameTracker:
         return None
     
     def get_event_score_name(self) -> str:
-        """Generate Discord event name with live score: 'BIG vs MIBR - 3:4 (1:0)'"""
-        return f"{self.match.team_a} vs {self.match.team_b} - {self.team_a_score}:{self.team_b_score} ({self.team_a_maps}:{self.team_b_maps})"
+        """Generate Discord event name with live score, e.g. 'BIG vs MIBR - 3:4 (1:0)'"""
+        score = "bra71l" if (self.team_a_score, self.team_b_score) == (7, 1) else f"{self.team_a_score}:{self.team_b_score}"
+        return f"{self.match.team_a} vs {self.match.team_b} - {score} ({self.team_a_maps}:{self.team_b_maps})"
 
 CS_EMOTE = "<:cs:1416235161594499092>"
 GAME_EMOJI = {"cs": CS_EMOTE, "lol": "<:lol:1416235138307854416>", "tm": "🏎️"}
@@ -353,8 +354,9 @@ def build_weekly_view(upcoming_matches: List["EsportsMatch"], week_start, week_e
     one block per day with event-linked match lines. Expects big_square.png
     to be attached to the message."""
     header = (
-        f"## This Week ({week_start.strftime('%B %d')} - {(week_end - timedelta(days=1)).strftime('%B %d')})\n"
-        f"-# Powered by [wannspieltbig.de](https://wannspieltbig.de) · [status](https://casparsadenius.de/status/roaringbot)"
+        f"## This Week\n"
+        f"### {week_start.strftime('%B %d')} - {(week_end - timedelta(days=1)).strftime('%B %d')}\n"
+        f"-# Powered by [wannspieltbig.de](https://wannspieltbig.de)"
     )
 
     container = discord.ui.Container(accent_colour=discord.Colour(0x00FF88))
@@ -2063,6 +2065,15 @@ class EsportsCog(commands.Cog):
         file = discord.File("resources/big_square.png", filename="big_square.png")
         await interaction.response.send_message(file=file, view=view, ephemeral=True)
 
+    def _is_upcoming_or_live(self, m: "EsportsMatch", now: datetime) -> bool:
+        """A match is still relevant for the weekly overview when it has not
+        finished yet (still upcoming or currently live)."""
+        if m.cancelled or m.id in self._livescore_finished_ids:
+            return False
+        if m.end_time is not None:
+            return m.end_time >= now
+        return m.start_time >= now - timedelta(hours=6)
+
     async def _send_weekly_summary(self, channel: discord.TextChannel):
         """Send weekly summary of upcoming matches"""
         try:
@@ -2098,8 +2109,7 @@ class EsportsCog(commands.Cog):
             
             upcoming_matches = [
                 match for match in self.matches.values()
-                if not match.cancelled and match.start_time > now
-                and week_start_utc <= match.start_time < week_end_utc
+                if self._is_upcoming_or_live(match, now) and week_start_utc <= match.start_time < week_end_utc
             ]
             
             # Sort by start time
@@ -2109,7 +2119,7 @@ class EsportsCog(commands.Cog):
             guild = channel.guild or (self.bot.get_guild(config.esports_guild_id) if config.esports_guild_id else None)
             btn_row = discord.ui.ActionRow()
             btn = discord.ui.Button(
-                label="Next weeks",
+                label="later",
                 style=discord.ButtonStyle.secondary,
                 custom_id="weekly_upcoming_btn",
             )
@@ -2205,8 +2215,7 @@ class EsportsCog(commands.Cog):
             
             upcoming_matches = [
                 match for match in self.matches.values()
-                if not match.cancelled and match.start_time > now
-                and week_start_utc <= match.start_time < week_end_utc
+                if self._is_upcoming_or_live(match, now) and week_start_utc <= match.start_time < week_end_utc
             ]
             
             # Sort by start time
@@ -2216,7 +2225,7 @@ class EsportsCog(commands.Cog):
             message = await channel.fetch_message(self.summary_message_id)
             btn_row = discord.ui.ActionRow()
             btn = discord.ui.Button(
-                label="Next weeks",
+                label="later",
                 style=discord.ButtonStyle.secondary,
                 custom_id="weekly_upcoming_btn",
             )
@@ -2288,17 +2297,16 @@ class EsportsCog(commands.Cog):
                 if played_map:
                     played_map_name = played_map.get("cs_name") or played_map.get("name")
 
-            if not played_map_name:
-                self.log.warning(f"No played_map_name found for match {tracker.match.id}, map {tracker.current_map}")
-                return
-
             # Prepare the update data
             update_data = {
                 "map_nr": tracker.current_map,
                 "rounds_won_team_a": tracker.team_a_score,
                 "rounds_won_team_b": tracker.team_b_score,
-                "played_map_name": played_map_name
             }
+            if played_map_name:
+                update_data["played_map_name"] = played_map_name
+            else:
+                self.log.debug(f"No played_map_name for match {tracker.match.id}, map {tracker.current_map} — sending score update without it")
             
             # Update the score via API
             url = f"https://wannspieltbig.de/api/matchmap_update/{tracker.current_map_id}/"

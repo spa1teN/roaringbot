@@ -15,7 +15,7 @@ aiohttp-REST-API auf Port 8080 für das Dashboard bereit.
 cogs/               # Discord-Cogs (ein File pro Feature)
   esports.py        # 2846 Zeilen — der größte und komplexeste Cog
   birthday.py       # Täglicher Geburtstags-Post um 10:00 Berlin-Zeit
-  moderation.py     # Member-Log, Join-Role, Honeypot, Bot-Trap, /clear
+  moderation.py     # Member-Log, Join-Role, Honeypot, Bot-Trap, /clear, /spa1timo
   finance.py        # Kassenbuch-Report am 1. des Monats
   feedback.py       # /feedback Slash-Command mit CV2-Modal
 core/
@@ -54,6 +54,8 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
 - Startzeit = Kickoff − 5 min (geclampt auf now+30s). Großzügiges
   `scheduled_end_time` (90 min/Map + 90 min Puffer) — nur für Discord-nötig.
 - Voice-Events wenn API `block_voice_channel` "VC 1"/"VC 2" + Env-Vars gesetzt.
+- Event-Description: `[wannspieltbig](detail_url)` und `🔗 [HLTV](hltv_url)` (CS-only)
+  in **einer Zeile** durch ` • ` getrennt — kein Zeilenumbruch zwischen den Links.
 - **Ende ausschließlich durch wannspieltbig-Signale**, nie durch Zeitschätzung:
   CS-Livescore-Loop beendet bei echtem Finish; API-verschwundene Matches via
   `_handle_match_finished`.
@@ -76,6 +78,13 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
 - Korrekte OT-Regeln (12-12 → first to 16, 15-15 → 19, …).
 - Jede Änderung wird via PUT an `wannspieltbig.de/api/matchmap_update/<id>/`
   zurückgeschrieben (Basic Auth: `WSB_User`/`WSB_PW` — exakte Schreibweise!).
+  `played_map_name` ist **optional** im Payload: Wenn die Site den Map-Namen
+  noch nicht gesetzt hat, wird der PUT trotzdem gesendet (nur ohne dieses Feld) —
+  sonst würden Score-Writes stillschweigend verworfen und der 30-s-Loop den
+  lokalen Stand wieder zurücksetzen.
+- Der Voice-Event-Name zeigt den Live-Stand (`_update_event_name_with_score` /
+  `get_event_score_name`). Easter Egg: Score `7:1` (in dieser Reihenfolge) wird
+  als `bra71l` angezeigt statt `7:1`; alle anderen Scores bleiben normal.
 - 30-s `live_score_updater`-Loop synct von `/api/match_livescore/` und erkennt
   Finish → Winner-Rendering, Event beendet, Tracker entfernt.
 - Tracker überleben Restarts via Postgres; Map-History ist In-Memory (wird in
@@ -126,9 +135,13 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
 
 **Weekly Summary:** Eine durchgehend editierte Nachricht pro Woche (Mo–So
 Europe/Berlin). Wochenwechsel → alte löschen, neue posten. CV2 mit Club-Logo
-(`big_square.png`) und Tagesblöcken. **Nur noch zukünftige Matches** werden
-gelistet — Matches, deren `start_time` bereits in der Vergangenheit liegt
-(= gespielt), fallen aus der Anzeige.
+(`big_square.png`) und Tagesblöcken. Header: `## This Week` mit dem
+Datumsintervall als `###`-Subtitle darunter + `-# Powered by wannspieltbig.de`
+(kein Status-Link mehr). Button `later` öffnet einen ephemeren View mit allen
+Matches nach der aktuellen Woche. Über `_is_upcoming_or_live` werden
+**beendete/abgelaufene Matches gefiltert** (cancelled, Livescore-beendet,
+`end_time` in der Vergangenheit, > 6 h alt ohne `end_time`) — die Übersicht
+zeigt also keine vergangenen Matches der aktuellen Woche mehr.
 
 **Event-Cover (2.5:1):** `_build_event_cover_media` → `compose_versus_image(..., h=640)` —
 1600×640, JPEG. Design: **nur** Hintergrund + beide Team-Logos (via
@@ -170,6 +183,8 @@ Summary-Channel nutzt `config.share_base_url`.
 - `/mod_dashboard`: CV2 LayoutView (ephemeral, admin-only) → Feature-Toggles mit
   Channel/Role-Pickern. Alle States sind CV2 (kein Edit zurück zu Embeds möglich).
 - `/clear <1-100>`: Bulk-Delete (admin-only, schlägt fehl für > 14 Tage alte Messages).
+- `/spa1timo`: Fun-Command, antwortet mit `"Lesen, Verstehen, Nachdenken,
+  Schreiben (oder besser nicht)"`.
 
 ### Feedback (feedback.py + core/api_server.py)
 
