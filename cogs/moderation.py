@@ -418,6 +418,11 @@ class ModerationCog(commands.Cog):
             else:
                 await interaction.followup.send("❌ An error occurred while deleting messages.", ephemeral=True)
 
+    @app_commands.command(name="spa1timo", description="Lesen, Verstehen, Nachdenken, Schreiben (oder besser nicht)")
+    async def spa1timo(self, interaction: discord.Interaction):
+        """Respond with the classic spa1timo quote"""
+        await interaction.response.send_message('"Lesen, Verstehen, Nachdenken, Schreiben (oder besser nicht)"')
+
 
     # ── Periodic config reporter (lightweight — no banning, just status) ──
 
