@@ -10,7 +10,7 @@ call, just targeting Postgres tables instead of a JSON file.
 """
 
 import json
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, Optional, Set
 
 from db.repositories.base import BaseRepository
 
@@ -70,7 +70,7 @@ class EsportsRepository(BaseRepository):
         known_match_ids: Set[int],
         active_cs_trackers: Dict[int, dict],
         livescore_finished_ids: Set[int] = None,
-        whatsapp_ping_sent: List[int] = None,
+        whatsapp_ping_sent: Dict[int, Optional[str]] = None,
         plain_ping_to_match: Dict[int, int] = None,
         event_cover_version: int = 0,
     ) -> None:
@@ -128,7 +128,7 @@ class EsportsRepository(BaseRepository):
                 await conn.execute(
                     """INSERT INTO esports_state (key, value) VALUES ('whatsapp_ping_sent', $1)
                        ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()""",
-                    json.dumps(list(whatsapp_ping_sent) if whatsapp_ping_sent else []),
+                    json.dumps(whatsapp_ping_sent if whatsapp_ping_sent else {}),
                 )
 
                 await conn.execute(

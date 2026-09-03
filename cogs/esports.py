@@ -726,7 +726,7 @@ class EsportsCog(commands.Cog):
         self.monitored_matches: Set[int] = set()  # Matches currently being monitored for start time
         self._pending_tracker_restore: Dict[int, dict] = {}  # Loaded from DB, applied after first API poll
         self._livescore_finished_ids: Set[int] = set()  # Match IDs finished via livescore sync; skip health checks until they leave the API
-        self._whatsapp_ping_sent: Set[int] = set()  # Match IDs that already got the 45-min WhatsApp ping
+        self._whatsapp_ping_sent: Dict[int, Optional[str]] = {}  # match_id → start_time (ISO) the ping was sent for; None for legacy entries
 
         # German timezone for weekly summary scheduling
         self.germany_tz = pytz.timezone("Europe/Berlin")
@@ -754,7 +754,11 @@ class EsportsCog(commands.Cog):
             self.monitored_matches = set(data["monitored_matches"])
             self.known_match_ids = set(data["known_match_ids"])
             self._livescore_finished_ids = set(data.get("livescore_finished_ids", []))
-            self._whatsapp_ping_sent = set(data.get("whatsapp_ping_sent", []))
+            _wa = data.get("whatsapp_ping_sent", [])
+            if isinstance(_wa, dict):
+                self._whatsapp_ping_sent = {int(k): v for k, v in _wa.items()}
+            else:
+                self._whatsapp_ping_sent = {int(x): None for x in _wa}
             self._event_cover_version = data.get("event_cover_version", 0)
             self._pending_tracker_restore = {
                 int(k): v for k, v in data["active_cs_trackers"].items()
@@ -795,7 +799,7 @@ class EsportsCog(commands.Cog):
                 known_match_ids=set(self.matches.keys()),
                 active_cs_trackers=active_cs_trackers,
                 livescore_finished_ids=self._livescore_finished_ids,
-                whatsapp_ping_sent=list(self._whatsapp_ping_sent),
+                whatsapp_ping_sent=self._whatsapp_ping_sent,
                 event_cover_version=self._event_cover_version,
             )
         except Exception as e:
@@ -1376,6 +1380,24 @@ class EsportsCog(commands.Cog):
                     f"Match {match_id} ({match.event_name}) previously finished via livescore "
                     f"reappeared as an upcoming fixture — cleared stale finished flag"
                 )
+
+        # Same match-id-reuse hazard for the 45-min WhatsApp ping: the flag was
+        # set for an OLD fixture's start time (e.g. "BIG vs. TBA" -> "BIG vs.
+        # magic"). If wannspieltbig.de reuses the match_id for a NEW fixture with
+        # a different future start_time, clear the stale "already pinged" flag so
+        # the new fixture gets its own ping. Legacy entries (None, from the old
+        # plain-IDs format) self-heal on the first poll: cleared whenever the
+        # match is still upcoming, then re-stored with the real start time.
+        for match_id, match in current_matches.items():
+            if (not match.cancelled and match.start_time > now
+                    and match_id in self._whatsapp_ping_sent):
+                sent_for_start = self._whatsapp_ping_sent[match_id]
+                if sent_for_start is None or sent_for_start != match.start_time.isoformat():
+                    del self._whatsapp_ping_sent[match_id]
+                    self.log.info(
+                        f"Match {match_id} ({match.event_name}) previously WhatsApp-pinged "
+                        f"for a different start time — cleared stale ping flag"
+                    )
 
         # Handle matches that disappeared from API (finished matches)
         for match_id, old_match in self.matches.items():
@@ -2871,7 +2893,7 @@ class EsportsCog(commands.Cog):
         view.add_item(container)
         try:
             await channel.send(view=view)
-            self._whatsapp_ping_sent.add(match.id)
+            self._whatsapp_ping_sent[match.id] = match.start_time.isoformat()
             self.log.info(f"WhatsApp ping sent for match {match.id} ({match.event_name})")
         except Exception as e:
             self.log.error(f"Failed to send WhatsApp ping for match {match.id}: {e}")

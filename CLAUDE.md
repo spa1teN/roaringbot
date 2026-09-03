@@ -141,6 +141,20 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
 - Reminder + Ping-Card werden automatisch gelöscht, wenn der Match endet
   (`_check_for_reminder_cleanup`).
 
+**45-Min-WhatsApp-Ping:**
+- Kleine CV2-Karte im `PING_WHATSAPP`-Channel 45 min vor Kickoff
+  (`_check_for_whatsapp_pings`, Fenster `0 < time_to_start <= 2700`, bleibt
+  für den gesamten 45-Min-Zeitraum offen). Button verlinkt auf die
+  Share-Seite (`config.share_base_url`).
+- Dedup via `_whatsapp_ping_sent` — ein Dict `match_id → Startzeit-ISO`
+  (Stand zum Ping-Zeitpunkt), persistiert in `esports_state`.
+  **Match-ID-Reuse**: Taucht ein Match mit **anderer zukünftiger Startzeit**
+  wieder auf (z. B. "BIG vs. TBA" → "BIG vs. magic"), cleart
+  `_process_match_updates` den Eintrag, damit das neue Fixture seinen eigenen
+  Ping bekommt (Sep-2026: kein Ping für das magic-Fixture, weil der Flag aus
+  dem TBA-Fixture stehen geblieben war). Legacy-Null-Einträge (altes
+  Listen-Format) heilen sich beim ersten Poll selbst.
+
 **Weekly Summary:** Eine durchgehend editierte Nachricht pro Woche (Mo–So
 Europe/Berlin). Wochenwechsel → alte löschen, neue posten. CV2 mit Club-Logo
 (`big_square.png`) und Tagesblöcken. Header: `## This Week` mit dem
