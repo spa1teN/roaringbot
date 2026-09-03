@@ -266,7 +266,7 @@ GAME_EMOJI = {"cs": CS_EMOTE, "lol": "<:lol:1416235138307854416>", "tm": "🏎�
 
 
 EVENT_COVER_H = 640  # 1600×640 = 2.5:1 — Discord event header shows covers at ~2.5:1 (800×320)
-EVENT_COVER_VERSION = 3  # bump when the cover composition changes → one-time re-upload of all scheduled events
+EVENT_COVER_VERSION = 4  # bump when the cover composition changes → one-time re-upload of all scheduled events
 
 def build_reminder_view(match: "EsportsMatch", guild_id: Optional[int], mention: Optional[str] = None,
                         versus: bool = False) -> discord.ui.LayoutView:

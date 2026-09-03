@@ -161,7 +161,12 @@ Event-Header mit ~2.5:1 (800×320) — die 4:1-Variante (1600×400) wurde dort
 verzerrt. Bei einer Cover-Kompositions-Änderung `EVENT_COVER_VERSION` bumpen;
 `_reconcile_event_covers` lädt dann einmalig alle bestehenden Scheduled-Event-
 Cover neu hoch (persistiert in `esports_state.event_cover_version`), sonst
-würden Events mit stabilen Metadaten das alte Cover behalten.
+würden Events mit stabilen Metadaten das alte Cover behalten. **Blindspot:**
+Die Reconciliation läuft nur einmal pro Bump — Events, die danach von einem
+älteren Build (z. B. vor dem Deployment der neuen Komposition) erstellt
+wurden, behalten das alte Cover. Fix: `EVENT_COVER_VERSION` erneut bumpen →
+nächster Restart lädt alle Covers neu hoch (Sep-2026: "BIG vs. magic" 4:1 →
+2.5:1 geheilt).
 
 **Spiegel-Modul:** `core/versus_image.py` ist gespiegelt im Share-Page-Service
 [wannspieltbig-social-preview](https://github.com/RoaringBearsBIG/wannspieltbig-social-preview)
