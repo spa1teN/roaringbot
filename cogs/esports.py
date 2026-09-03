@@ -2914,14 +2914,25 @@ class EsportsCog(commands.Cog):
                 + urllib.parse.quote(re.sub(r"^https?://", "", match.team_b_logo_url), safe="")
                 + "&w=400"
             )
+            logo_bytes = None
             response = await http_client.get(proxy_url)
             try:
-                if response.status != 200:
-                    self.log.warning(f"Logo proxy returned HTTP {response.status} for match {match.id}")
-                    return None
-                logo_bytes = await response.read()
+                if response.status == 200:
+                    logo_bytes = await response.read()
             finally:
                 await response.release()
+            if logo_bytes is None:
+                # Proxy failed — try the raw URL directly
+                self.log.debug(f"Logo proxy failed for match {match.id}, trying direct fetch: {match.team_b_logo_url}")
+                response = await http_client.get(match.team_b_logo_url)
+                try:
+                    if response.status == 200:
+                        logo_bytes = await response.read()
+                finally:
+                    await response.release()
+            if logo_bytes is None:
+                self.log.warning(f"Logo fetch failed (proxy + direct) for match {match.id}")
+                return None
             versus = await asyncio.to_thread(compose_versus_image, logo_bytes, **compose_kwargs)
             self._versus_cache[match.id] = (cache_sig, versus)
             return versus

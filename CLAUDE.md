@@ -123,8 +123,11 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
   Bild-Komposition, 2:1, JPEG quality 85, game-spezifische Hintergründe,
   Schlagschatten, CS-Dreieck-Overlays). Game-Role-Ping **30 s verzögert**
   (`REMINDER_PING_DELAY`) in separater Nachricht.
-- Opponent-Logo via images.weserv.nl-Proxy (HLTV-CDN blockt Server-IPs); Fallback:
-  alte Two-Tile-Gallery.
+- Opponent-Logo via images.weserv.nl-Proxy (HLTV-CDN blockt Server-IPs). Bei
+  Proxy-Nicht-200 (z. B. Liquipedia blockt weserv) wird die Raw-URL direkt
+  gefetcht (gleicher Direct-Fetch-Fallback wie `_build_event_cover_media`);
+  erst wenn **beides** fehlschlägt → `None` → alte Two-Tile-Gallery
+  (`big.png` + Opponent-Logo-URL).
 - **Ping-Card (CS-Large-Role-Workaround)**: CV2-Karte im Summary-Channel mit
   "Match Thread"-Button, umgeht Discords 250-Member-Thread-Ping-Limit.
 - **Reschedule/Update**: `_edit_reminder_message` aktualisiert bei Time- oder
