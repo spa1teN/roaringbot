@@ -99,6 +99,11 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
   "Match erfolgreich beendet"-Chip statt falscher roter Fehler-Dots.
 - Dieser Guard ist kritisch: Ohne ihn meldet das Dashboard "Discord event fehlt"
   und rote Voice-Event-Dots für sauber beendete Matches.
+- **Match-ID-Reuse**: `_process_match_updates` cleared die ID aus dem Set, wenn
+  der Match mit **zukünftiger `start_time`** wieder in der API auftaucht —
+  wannspieltbig.de nutzt dann dieselbe match_id für ein neues Fixture (z. B.
+  "BIG vs. TBA" → "BIG vs. magic"). Ohne das Clear bliebe der neue Match
+  dauerhaft aus der Weekly-Summary gefiltert, obwohl sein Discord-Event existiert.
 
 **Dashboard-Daten (`_compute_next_matches`):**
 - `cleanly_finished`: `True` wenn in `_livescore_finished_ids`

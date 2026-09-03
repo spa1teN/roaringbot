@@ -1363,6 +1363,20 @@ class EsportsCog(commands.Cog):
     async def _process_match_updates(self, current_matches: Dict[int, EsportsMatch]):
         """Process match updates and manage Discord events"""
 
+        # A match previously finished via livescore that reappears with a future
+        # start_time means wannspieltbig.de reused the match_id for a new fixture
+        # (e.g. "BIG vs. TBA" -> "BIG vs. magic"). Clear the stale "finished" flag
+        # so the new fixture is tracked, health-checked and shown in the weekly
+        # overview again instead of being silently filtered out.
+        now = datetime.now(timezone.utc)
+        for match_id, match in current_matches.items():
+            if match_id in self._livescore_finished_ids and match.start_time > now:
+                self._livescore_finished_ids.discard(match_id)
+                self.log.info(
+                    f"Match {match_id} ({match.event_name}) previously finished via livescore "
+                    f"reappeared as an upcoming fixture — cleared stale finished flag"
+                )
+
         # Handle matches that disappeared from API (finished matches)
         for match_id, old_match in self.matches.items():
             if match_id not in current_matches:
