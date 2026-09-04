@@ -104,6 +104,13 @@ Reminder. Reschedules → Event/Reminder-Update. Verschwundene Matches → Clean
   wannspieltbig.de nutzt dann dieselbe match_id für ein neues Fixture (z. B.
   "BIG vs. TBA" → "BIG vs. magic"). Ohne das Clear bliebe der neue Match
   dauerhaft aus der Weekly-Summary gefiltert, obwohl sein Discord-Event existiert.
+  Derselbe Reuse-Pfad cleared auch den stale `monitored_matches`-Eintrag für
+  Matches, die zwar (noch) als "wird auf Tracking-Start überwacht" markiert,
+  aber NICHT in `active_cs_games` sind (Livescore-beendete Fixtures behalten
+  ihren monitored-Flag, bis sie die API verlassen). Ohne dieses Clear würde
+  `_check_for_starting_matches` das neue Fixture dauerhaft überspringen →
+  kein Score-Tracking und keine Scores im Event-Namen (Sep-2026: "BIG vs.
+  magic" wurde nie getrackt, der Flag vom beendeten "BIG vs. TBA" war noch gesetzt).
 
 **Dashboard-Daten (`_compute_next_matches`):**
 - `cleanly_finished`: `True` wenn in `_livescore_finished_ids`

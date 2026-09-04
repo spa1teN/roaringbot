@@ -1399,6 +1399,25 @@ class EsportsCog(commands.Cog):
                         f"for a different start time — cleared stale ping flag"
                     )
 
+        # Same match-id-reuse hazard for the "monitored for tracking start" flag.
+        # A match that finished via livescore keeps its monitored_matches entry
+        # until it leaves the API (only _handle_match_finished clears it). If
+        # wannspieltbig.de reuses the match_id for a NEW upcoming fixture, that
+        # stale flag would make _check_for_starting_matches skip it forever —
+        # no score tracking, no event-name score updates (Sep-2026: "BIG vs.
+        # magic" never got tracked because the flag from the finished "BIG vs.
+        # TBA" fixture was still set). Actively tracked matches are in
+        # active_cs_games and are left untouched.
+        for match_id, match in current_matches.items():
+            if (not match.cancelled and match.start_time > now
+                    and match_id in self.monitored_matches
+                    and match_id not in self.active_cs_games):
+                self.monitored_matches.discard(match_id)
+                self.log.info(
+                    f"Match {match_id} ({match.event_name}) flagged for monitoring "
+                    f"without an active tracker — cleared stale monitored flag"
+                )
+
         # Handle matches that disappeared from API (finished matches)
         for match_id, old_match in self.matches.items():
             if match_id not in current_matches:
